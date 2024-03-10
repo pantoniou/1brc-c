@@ -64,6 +64,33 @@ static inline uint64_t zbyte_mangle(uint64_t x)
 	return y;
 }
 
+static inline int zbyte_bpos(uint64_t mv)
+{
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+	return __builtin_ctzl((long)mv);
+#else
+	return __builtin_clzl((long)mv);
+#endif
+}
+
+static inline int zbyte_bpos_to_adv(int bpos)
+{
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+	return bpos >> 3;
+#else
+	return (bpos + 1) >> 3;
+#endif
+}
+
+static inline uint64_t zbyte_mask_from_bpos(int bpos)
+{
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+	return (((uint64_t)-1) >> (64 - (bpos - 7)));
+#else
+	return (((uint64_t)-1) << (64 - bpos));
+#endif
+}
+
 static inline uint32_t zbyte_mangle_u32(uint32_t x)
 {
 	uint32_t y;
@@ -72,6 +99,25 @@ static inline uint32_t zbyte_mangle_u32(uint32_t x)
 	y = ~(y | x | 0x7F7F7F7FU);		// 80 00 00000000
 	return y;
 }
+
+static inline int zbyte_bpos_u32(uint32_t mv)
+{
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+	return __builtin_ctz((int)mv);
+#else
+	return __builtin_clz((int)mv);
+#endif
+}
+
+static inline uint32_t zbyte_mask_from_bpos_u32(int bpos)
+{
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+	return (((uint32_t)-1) >> (32 - (bpos - 7)));
+#else
+	return (((uint32_t)-1) << (32 - bpos));
+#endif
+}
+
 
 static inline uint32_t zbyte_mangle_mask_u32(uint32_t mv)
 {
@@ -402,15 +448,11 @@ static int wb_process_actual(struct work_block *wb)
 	char c;
 	int16_t neg, tempi;
 	uint64_t cv, h, mv, m;
-	uint32_t nv, nmv, nm;
+	uint32_t nv, nmv;
 	int wpos, bpos, adv;
 #ifdef CHECKS
 	long line;
 #endif
-
-	(void)mv;
-	(void)bpos;
-	(void)m;
 
 	s = wb->wd->start + wb->offset;
 	e = s + wb->size;
@@ -457,22 +499,14 @@ static int wb_process_actual(struct work_block *wb)
 				cs = s;
 				s = p;
 
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-				bpos = __builtin_ctzl((long)mv);
-				adv = bpos >> 3;
-#else
-				bpos = __builtin_clzl((long)mv);
-				adv = (bpos + 1) >> 3;
-#endif
+				bpos = zbyte_bpos(mv);
+				adv = zbyte_bpos_to_adv(bpos);
 				if (adv) {
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-					m = (((uint64_t)-1) >> (64 - (bpos - 7)));
-#else
-					m = (((uint64_t)-1) << (64 - bpos));
-#endif
+					m = zbyte_mask_from_bpos(bpos);
 					h = hash_update(h, cv & m);
 					s += adv;
 				}
+
 				ce = s++;
 				goto next_name;
 			}
@@ -521,9 +555,10 @@ next_name:
 
 			nmv = zbyte_mangle_u32(nv ^ NEWLINES_U32);
 			if (nmv) {
-				nm = zbyte_mangle_mask_u32(nmv);
-				nv &= nm;
-				s += zbyte_mangle_mask_advance_u32(nm);
+				bpos = zbyte_bpos_u32(nmv);
+				nv &= zbyte_mask_from_bpos_u32(bpos);
+				adv = zbyte_bpos_to_adv(bpos);
+				s += adv;
 			} else
 				s += sizeof(uint32_t); /* no newline, it's a full 4 bytes */
 			ne = s++;
