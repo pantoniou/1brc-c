@@ -64,24 +64,6 @@ static inline uint64_t zbyte_mangle(uint64_t x)
 	return y;
 }
 
-static inline uint64_t zbyte_mangle_mask(uint64_t mv)
-{
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-	return (mv >> 7) - 1;
-#else
-	return ~((mv << 1) - 1);
-#endif
-}
-
-static inline int zbyte_mangle_mask_advance(uint64_t m)
-{
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-	return __builtin_ctzl((long)~m) >> 3;
-#else
-	return __builtin_clzl((long)~m) >> 3;
-#endif
-}
-
 static inline uint32_t zbyte_mangle_u32(uint32_t x)
 {
 	uint32_t y;
@@ -467,20 +449,30 @@ static int wb_process_actual(struct work_block *wb)
 			//    cv 0x34_3b_7261626f6f46   0x466f6f626172_3b_34
 			//    mv 0x00_80_000000000000   0x000000000000_80_00
 			//     m 0x00_00_ffffffffffff   0xffffffffffff_00_00
-			//  bpos 55
-			//   adv 7
+			//  bpos                   55                     48
+			//   adv                    7                      7
 			//
 			mv = zbyte_mangle(cv ^ SEMICOLONS);
 			if (mv) {
 				cs = s;
+				s = p;
 
+#if __BYTE_ORDER == __LITTLE_ENDIAN
 				bpos = __builtin_ctzl((long)mv);
-				adv = (bpos >> 3);
-				if (adv > 0) {
+				adv = bpos >> 3;
+#else
+				bpos = __builtin_clzl((long)mv);
+				adv = (bpos + 1) >> 3;
+#endif
+				if (adv) {
+#if __BYTE_ORDER == __LITTLE_ENDIAN
 					m = (((uint64_t)-1) >> (64 - (bpos - 7)));
+#else
+					m = (((uint64_t)-1) << (64 - bpos));
+#endif
 					h = hash_update(h, cv & m);
+					s += adv;
 				}
-				s = p + adv;
 				ce = s++;
 				goto next_name;
 			}
