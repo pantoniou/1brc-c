@@ -227,7 +227,7 @@ struct city_data {
 
 struct work_block {
 	struct weather_data *wd;
-	off_t offset; 
+	off_t offset;
 	size_t size;
 	unsigned int city_count;
 	unsigned int collisions;
@@ -442,7 +442,6 @@ static int wb_process_actual(struct work_block *wb)
 	struct city_data *cd;
 	const char *s, *e, *p;
 	const char *cs, *ce;
-	size_t clen;
 	const char *ns, *ne;
 	size_t nlen;
 	char c;
@@ -477,9 +476,10 @@ static int wb_process_actual(struct work_block *wb)
 #endif
 
 		h = hash_setup();
-		p = s;	/* unaligned accesses here! */
+
+		p = s;
 		while ((size_t)(e - p) >= sizeof(uint64_t)) {
-			cv = load64(p);
+			cv = load64(p);		/* unaligned accesses here! */
 
 			//
 			// return a mask with 80 where a semicolon is
@@ -508,6 +508,7 @@ static int wb_process_actual(struct work_block *wb)
 				}
 
 				ce = s++;
+
 				goto next_name;
 			}
 
@@ -536,7 +537,6 @@ static int wb_process_actual(struct work_block *wb)
 			h = hash_update(h, cv & pos_mask(wpos));
 		ce = s - 1;
 next_name:
-		clen = (size_t)(ce - cs);
 
 		OOB();
 		/* negative sign */
@@ -548,7 +548,7 @@ next_name:
 		} else
 			neg = 1;
 
-		/* scan forward for the newline, note that can only be max XX.X\n so... */ 
+		/* scan forward for the newline, note that can only be max XX.X\n so... */
 		ns = s;
 		if ((e - s) >= sizeof(uint32_t)) {
 			nv = load32(s);	/* unaligned accesses here! */
@@ -562,11 +562,10 @@ next_name:
 			} else
 				s += sizeof(uint32_t); /* no newline, it's a full 4 bytes */
 			ne = s++;
-			nlen = (size_t)(ne - ns);
 			ASSERT(s >= e || s[-1] == '\n');
 			goto next_temp;
 		}
-		
+
 		/* fallback slow path */
 		wpos = 0;
 		nv = 0;
@@ -582,21 +581,12 @@ next_name:
 		ne = s;
 		if (c == '\n')
 			ne--;
-		nlen = (size_t)(ne - ns);
 next_temp:
 
-		ASSERT(nlen <= 4);
-
-		// printf("%.*s;%s%.*s - %d 0x%016lx 0x%03x\n", (int)clen, cs, neg ? "-" : "", (int)nlen, ns, (int)nlen, nv, dm);
-		
-#ifdef CHECKS
-		wb_check_parse(line, e, cs, clen, ns, nlen, h);
-#endif
-
-		cd = wb_lookup_or_create_city(wb, cs, clen, h);
-		ASSERT(cd);
+		ASSERT((ne - ns) <= 4);
 
 		/* convert 3 digit form to 4 digit form */
+		nlen = (size_t)(ne - ns);
 		ASSERT(nlen == 3 || nlen == 4);
 		// 3: 00011 << 2 -> 01100 & 8 -> 01000 = 8
 		// 4: 00100 << 2 -> 10000 & 8 -> 00000 = 0
@@ -604,7 +594,16 @@ next_temp:
 		/* neg = -1 or 1 */
 		tempi = parse_temp(nv) * neg;
 
-		// printf("> %.*s %3.1f\n", (int)clen, cs, (float)tempi / 10.0);
+		// printf("%.*s;%s%.*s - %d 0x%016lx 0x%03x\n", (int)(ce - cs), cs, neg ? "-" : "", (int)(ne - ns), ns, (int)(ne - ns), nv, dm);
+
+#ifdef CHECKS
+		wb_check_parse(line, e, cs, (size_t)(ce - cs), ns, (size_t)(ne - ns), h);
+#endif
+
+		cd = wb_lookup_or_create_city(wb, cs, (size_t)(ce - cs), h);
+		ASSERT(cd);
+
+		// printf("> %.*s %3.1f\n", (int)(size_t)(ce - cs), cs, (float)tempi / 10.0);
 
 		cd->count++;
 		cd->sumt += tempi;
