@@ -1,4 +1,4 @@
-.PHONY: all clean
+.PHONY: all clean check
 
 CC=gcc
 # CC=clang
@@ -14,3 +14,10 @@ all: 1brc-c
 
 clean:
 	@rm -f 1brc-c
+
+check: 1brc-c
+	@for t in samples/*.txt ; do \
+		echo $$t `basename $$t`.out; \
+	done
+
+		# ./1brc-c $${t} | diff -u - $(basename 

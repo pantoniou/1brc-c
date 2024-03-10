@@ -148,34 +148,13 @@ static inline uint32_t set_char_at_pos_u32(uint32_t v, char c, int pos)
 #endif
 }
 
-static inline int16_t parse_temp_u32(uint32_t nv, size_t nlen)
+static inline int16_t parse_temp(uint32_t nv)
 {
-	int16_t tempi;
-
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-	if (nlen == 3) {
-		// 00_39_2e_38
-		tempi =	((nv >> 16) & 0x0f) +		/* 8.9 [9] */
-			((nv      ) & 0x0f) * 10;	/* 8.9 [8] */
-	} else {
-		// 39_2e_38_37
-		tempi = ((nv >> 24) & 0x0f) +		/* 78.9 [9] */
-			((nv >>  8) & 0x0f) * 10 +	/* 78.9 [8] */
-			((nv      ) & 0x0f) * 100;	/* 78.9 [7] */
-	}
-#else
-	if (nlen == 3) {
-		// 38_2e_39_00
-		tempi =	((nv >>  8) & 0x0f) +		/* 8.9 [9] */
-			((nv >> 24) & 0x0f) * 10;	/* 8.9 [8] */
-	} else {
-		// 37_38_2e_39
-		tempi = ((nv      ) & 0x0f) +		/* 78.9 [9] */
-			((nv >> 16) & 0x0f) * 10 +	/* 78.9 [8] */
-			((nv >> 24) & 0x0f) * 100;	/* 78.9 [7] */
-	}
+#if __BYTE_ORDER != __LITTLE_ENDIAN
+	/* the following magic calculation only works in little endian */
+	nv = __builtin_bswap16(nv);
 #endif
-	return tempi;
+	return ((nv & 0x0f000f0f) * (uint64_t)(1 + (10 << 16) + (100 << 24)) >> 24) & ((1 << 10) - 1);
 }
 
 #ifdef HASH_MURMUR
@@ -376,7 +355,7 @@ void wb_check_parse(long line, const char *e, const char *cs, size_t clen, const
 	const char *vs;
 	const char *vcs, *vce;
 	const char *vns, *vne;
-	uint64_t vh = h, v;
+	uint64_t vh, v;
 	int wpos;
 	char c;
 
@@ -397,10 +376,8 @@ void wb_check_parse(long line, const char *e, const char *cs, size_t clen, const
 			wpos = 0;
 		}
 	}
-	if (wpos > 0) {
-		v &= pos_mask(wpos);
+	if (wpos > 0)
 		vh = hash_update(vh, v);
-	}
 	vce = vs - 1;
 
 	/* verify */
@@ -444,7 +421,7 @@ static int wb_process_actual(struct work_block *wb)
 	int16_t neg, tempi;
 	uint64_t cv, h, mv, m;
 	uint32_t nv, nmv, nm;
-	int wpos, bpos;
+	int wpos, bpos, adv;
 #ifdef CHECKS
 	long line;
 #endif
@@ -485,22 +462,26 @@ static int wb_process_actual(struct work_block *wb)
 			//
 			// Input: 'Foobar;4'
 			// Need to advance 6
-			//                      LE                     BE
-			//       4  ;  r a b o o F      F o o b a r  ;  4
-			// cv 0x34_3b_7261626f6f46   0x466f6f626172_3b_34
-			// mv 0x00_80_000000000000   0x000000000000_80_00
-			//  m 0x00_00_ffffffffffff   0xffffffffffff_00_00
-			// ~m 0xff_ff_000000000000   0x000000000000_ff_ff
+			//                         LE                     BE
+			//          4  ;  r a b o o F      F o o b a r  ;  4
+			//    cv 0x34_3b_7261626f6f46   0x466f6f626172_3b_34
+			//    mv 0x00_80_000000000000   0x000000000000_80_00
+			//     m 0x00_00_ffffffffffff   0xffffffffffff_00_00
+			//  bpos 55
+			//   adv 7
 			//
 			mv = zbyte_mangle(cv ^ SEMICOLONS);
 			if (mv) {
 				cs = s;
-				m = zbyte_mangle_mask(mv);
-				s = p + zbyte_mangle_mask_advance(m);
-				if (m)
+
+				bpos = __builtin_ctzl((long)mv);
+				adv = (bpos >> 3);
+				if (adv > 0) {
+					m = (((uint64_t)-1) >> (64 - (bpos - 7)));
 					h = hash_update(h, cv & m);
+				}
+				s = p + adv;
 				ce = s++;
-				clen = (size_t)(ce - cs);
 				goto next_name;
 			}
 
@@ -528,8 +509,8 @@ static int wb_process_actual(struct work_block *wb)
 		if (wpos > 0)
 			h = hash_update(h, cv & pos_mask(wpos));
 		ce = s - 1;
-		clen = (size_t)(ce - cs);
 next_name:
+		clen = (size_t)(ce - cs);
 
 		OOB();
 		/* negative sign */
@@ -588,8 +569,13 @@ next_temp:
 		cd = wb_lookup_or_create_city(wb, cs, clen, h);
 		ASSERT(cd);
 
+		/* convert 3 digit form to 4 digit form */
+		ASSERT(nlen == 3 || nlen == 4);
+		// 3: 00011 << 2 -> 01100 & 8 -> 01000 = 8
+		// 4: 00100 << 2 -> 10000 & 8 -> 00000 = 0
+		nv <<= (nlen << 2) & 0x08;
 		/* neg = -1 or 1 */
-		tempi = parse_temp_u32(nv, nlen) * neg;
+		tempi = parse_temp(nv) * neg;
 
 		// printf("> %.*s %3.1f\n", (int)clen, cs, (float)tempi / 10.0);
 
@@ -646,7 +632,6 @@ int wb_process(struct work_block *wb)
 		split = wb->size / nchildren;
 		if (split >= pagesz)
 			break;
-		nchildren--;
 	}
 
 	/* if there are no children, or too small we have to do the work */
@@ -775,10 +760,14 @@ void wb_report(struct work_block *wb)
 
 	for (i = 0; i < count; i++) {
 		cd = cdtab[i];
-		printf("#%d: %.*s min=%3.1f max=%3.1f mean=%3.1f\n", i,
-				(int)cd->len, cd->name,
-				cd->mint * 0.1, cd->maxt * 0.1,
-				round((float)cd->sumt / cd->count) * 0.1);
+		printf("%s%s%s=%3.1f/%3.1f/%3.1f%s",
+				i == 0 ? "{" : "",
+				i > 0 ? ", " : "",
+				cd->name,
+				(float)cd->mint * 0.1,
+				round((float)cd->sumt / cd->count) * 0.1,
+				(float)cd->maxt * 0.1,
+				i >= (count - 1) ? "}\n" : "");
 	}
 
 	free(cdtab);
