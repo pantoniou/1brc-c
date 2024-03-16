@@ -1,11 +1,11 @@
 .PHONY: all clean check
 
 CC=gcc
-# CC=clang
-# CFLAGS=-O1 -Wall -g -fsanitize=address -fno-omit-frame-pointer -DCHECKS
+# CC=clang-15
+# CFLAGS=-O1 -Wall -g -fsanitize=address -fno-omit-frame-pointer -DCHECKS 
 # CFLAGS=-O3 -Wall -march=native -mtune=native -flto
 # CFLAGS=-O2 -Wall -g -fno-omit-frame-pointer
-CFLAGS=-O2 -Wall
+CFLAGS=-O2 -Wall -g
 
 all: 1brc-c
 

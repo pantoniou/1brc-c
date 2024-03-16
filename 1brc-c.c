@@ -25,6 +25,13 @@
 #include <alloca.h>
 #include <pthread.h>
 
+#define MAX_STATION_BYTES	100
+#define MAX_STATION_COUNT	10000
+#define MAX_TEMP_BYTES		(1 + 4)	/* -99.9 */
+#define MAX_LINE_SIZE		(MAX_STATION_BYTES + 1 + MAX_TEMP_BYTES + 1)
+
+#define ALWAYS_INLINE		static inline __attribute__((always_inline))
+
 // #undef CHECKS
 // #define CHECKS
 
@@ -36,17 +43,35 @@
 
 #define HASH_MURMUR
 
-static inline uint64_t load64(const void *p)
+ALWAYS_INLINE uint64_t load64(const void *p)
 {
 	/* most arches support this */
 	return *(const uint64_t *)p;
 }
 
-static inline uint32_t load32(const void *p)
+ALWAYS_INLINE uint32_t load32(const void *p)
 {
 	/* most arches support this */
 	return *(const uint32_t *)p;
 }
+
+#ifdef CHECKS
+ALWAYS_INLINE uint64_t load64_guard(const void *p, const void *e, uint64_t guard)
+{
+	/* in the buffer */
+	if (!guard || (p + sizeof(uint64_t)) <= e)
+		return load64(p);
+	if (p >= e)
+		return guard;
+	memcpy(&guard, p, (size_t)(e - p));
+	return guard;
+}
+#else
+static inline uint64_t load64_guard(const void *p, const void *e, uint64_t guard)
+{
+	return load64(p);
+}
+#endif
 
 #define SEMICOLON	0x3b  /*  ; */
 #define NEWLINE		0x0a  /* \n */
@@ -55,7 +80,7 @@ static inline uint32_t load32(const void *p)
 #define CARRYMASKS	0x7F7F7F7F7F7F7F7FLU
 #define NEWLINES_U32	0x0a0a0a0aU
 
-static inline uint64_t zbyte_mangle(uint64_t x)
+ALWAYS_INLINE uint64_t zbyte_mangle(uint64_t x)
 {
 	uint64_t y;
 								// Original byte: 00 80 other
@@ -64,7 +89,7 @@ static inline uint64_t zbyte_mangle(uint64_t x)
 	return y;
 }
 
-static inline int zbyte_bpos(uint64_t mv)
+ALWAYS_INLINE int zbyte_bpos(uint64_t mv)
 {
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 	return __builtin_ctzl((long)mv);
@@ -73,7 +98,7 @@ static inline int zbyte_bpos(uint64_t mv)
 #endif
 }
 
-static inline int zbyte_bpos_to_adv(int bpos)
+ALWAYS_INLINE int zbyte_bpos_to_adv(int bpos)
 {
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 	return bpos >> 3;
@@ -82,7 +107,7 @@ static inline int zbyte_bpos_to_adv(int bpos)
 #endif
 }
 
-static inline uint64_t zbyte_mask_from_bpos(int bpos)
+ALWAYS_INLINE uint64_t zbyte_mask_from_bpos(int bpos)
 {
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 	return (((uint64_t)-1) >> (64 - (bpos - 7)));
@@ -91,7 +116,7 @@ static inline uint64_t zbyte_mask_from_bpos(int bpos)
 #endif
 }
 
-static inline uint32_t zbyte_mangle_u32(uint32_t x)
+ALWAYS_INLINE uint32_t zbyte_mangle_u32(uint32_t x)
 {
 	uint32_t y;
 						// Original byte: 00 80 other
@@ -100,7 +125,7 @@ static inline uint32_t zbyte_mangle_u32(uint32_t x)
 	return y;
 }
 
-static inline int zbyte_bpos_u32(uint32_t mv)
+ALWAYS_INLINE int zbyte_bpos_u32(uint32_t mv)
 {
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 	return __builtin_ctz((int)mv);
@@ -109,7 +134,7 @@ static inline int zbyte_bpos_u32(uint32_t mv)
 #endif
 }
 
-static inline uint32_t zbyte_mask_from_bpos_u32(int bpos)
+ALWAYS_INLINE uint32_t zbyte_mask_from_bpos_u32(int bpos)
 {
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 	return (((uint32_t)-1) >> (32 - (bpos - 7)));
@@ -118,47 +143,7 @@ static inline uint32_t zbyte_mask_from_bpos_u32(int bpos)
 #endif
 }
 
-
-static inline uint32_t zbyte_mangle_mask_u32(uint32_t mv)
-{
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-	return (mv >> 7) - 1;
-#else
-	return ~((mv << 1) - 1);
-#endif
-}
-
-static inline int zbyte_mangle_mask_advance_u32(uint32_t m)
-{
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-	return __builtin_ctz((int)~m) >> 3;
-#else
-	return __builtin_clz((int)~m) >> 3;
-#endif
-}
-
-static inline uint64_t pos_mask(int wpos)
-{
-	/*
-	 * pos               BE               LE
-	 * --- ----------------  ---------------
-	 *   0 0000000000000000 0000000000000000
-	 *   1 FF00000000000000 00000000000000FF
-	 *   2 FFFF000000000000 000000000000FFFF
-	 *   3 FFFFF00000000000 0000000000FFFFFF
-	 *   4 FFFFFFF000000000 00000000FFFFFFFF
-	 *   5 FFFFFFFFF0000000 000000FFFFFFFFFF
-	 *   6 FFFFFFFFFFFF0000 0000FFFFFFFFFFFF
-	 *   7 FFFFFFFFFFFFFF00 00FFFFFFFFFFFFFF
-	 */
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-	return ~0LLU >> (64 - ((wpos << 3)));
-#else
-	return ~0LLU << (64 - ((wpos << 3)));
-#endif
-}
-
-static inline uint64_t set_char_at_pos(uint64_t v, char c, int pos)
+ALWAYS_INLINE uint64_t set_char_at_pos(uint64_t v, char c, int pos)
 {
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 	return v | (((uint64_t)(uint8_t)c) << (pos << 3));
@@ -167,16 +152,7 @@ static inline uint64_t set_char_at_pos(uint64_t v, char c, int pos)
 #endif
 }
 
-static inline uint32_t set_char_at_pos_u32(uint32_t v, char c, int pos)
-{
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-	return v | (((uint32_t)(uint8_t)c) << (pos << 3));
-#else
-	return v | (((uint32_t)(uint8_t)c) << ((3 - pos) << 3));
-#endif
-}
-
-static inline int16_t parse_temp(uint32_t nv)
+ALWAYS_INLINE int16_t parse_temp(uint32_t nv)
 {
 #if __BYTE_ORDER != __LITTLE_ENDIAN
 	/* the following magic calculation only works in little endian */
@@ -191,7 +167,7 @@ static inline int16_t parse_temp(uint32_t nv)
 #define PRIME_2 14029467366897019727ULL
 #define PRIME_3  1609587929392839161ULL
 
-static inline uint64_t hash_setup(void)
+ALWAYS_INLINE uint64_t hash_setup(void)
 {
 	uint64_t h;
 
@@ -199,7 +175,7 @@ static inline uint64_t hash_setup(void)
 	return h;
 }
 
-static inline uint64_t hash_update(uint64_t h, uint64_t k)
+ALWAYS_INLINE uint64_t hash_update(uint64_t h, uint64_t k)
 {
 	k *= PRIME_1;
 	k = (k << 31) | (k >> (64 - 31));
@@ -223,7 +199,8 @@ struct city_data {
 	size_t len;
 };
 
-#define CITIES_HASH_SIZE	8192
+#define CITIES_HASH_SIZE	4096
+// #define CITIES_HASH_SIZE	16384
 
 struct work_block {
 	struct weather_data *wd;
@@ -326,7 +303,8 @@ void wb_destroy(struct work_block *wb)
 	free(wb);
 }
 
-static inline struct city_data *wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, uint64_t h)
+ALWAYS_INLINE struct city_data *
+wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, uint64_t h)
 {
 	struct city_data *cd, **cdheadp;
 	unsigned int idx;
@@ -357,24 +335,6 @@ static inline struct city_data *wb_lookup_or_create_city(struct work_block *wb, 
 		wb->collisions++;
 #endif
 	return cd;
-}
-
-long wb_count_lines(struct work_block *wb)
-{
-	long lines;
-	const char *s, *e;
-	char c;
-
-	s = wb->wd->start + wb->offset;
-	e = s + wb->size;
-
-	lines = 0;
-	while (s < e) {
-		c = *s++;
-		if (c == '\n')
-			lines++;
-	}
-	return lines;
 }
 
 void wb_check_parse(long line, const char *e, const char *cs, size_t clen, const char *ns, size_t nlen, uint64_t h)
@@ -437,27 +397,6 @@ void wb_check_parse(long line, const char *e, const char *cs, size_t clen, const
 	ASSERT(vne == ne);
 }
 
-static int wb_process_actual(struct work_block *wb)
-{
-	struct city_data *cd;
-	const char *s, *e, *p;
-	const char *cs, *ce;
-	const char *ns, *ne;
-	size_t nlen;
-	char c;
-	int16_t neg, tempi;
-	uint64_t cv, h, mv, m;
-	uint32_t nv, nmv;
-	int wpos, bpos, adv;
-#ifdef CHECKS
-	long line;
-#endif
-
-	s = wb->wd->start + wb->offset;
-	e = s + wb->size;
-
-	madvise((void *)s, (size_t)(e - s), MADV_SEQUENTIAL | MADV_WILLNEED);
-
 #undef OOB
 #ifndef CHECKS
 #define OOB() do { /* nothing */ } while(0)
@@ -465,158 +404,137 @@ static int wb_process_actual(struct work_block *wb)
 #define OOB() do { if (s > e) abort(); } while(0)
 #endif
 
-#ifdef CHECKS
-	line = 0;
-#endif
+ALWAYS_INLINE const char *
+wb_parse_line(struct work_block *wb, const char *s, const char *e, bool check)
+{
+	struct city_data *cd;
+	const char *cs, *ce;
+	const char *ns, *ne;
+	size_t nlen;
+	char c;
+	int16_t neg, tempi;
+	uint64_t cv, h, mv, m;
+	uint32_t nv, nmv;
+	int bpos, adv;
 
-	while (s < e) {
+	h = hash_setup();
 
-#ifdef CHECKS
-		line++;
-#endif
+	//
+	// Input: 'Foobar;4'
+	// Need to advance 6
+	//                         LE                     BE
+	//          4  ;  r a b o o F      F o o b a r  ;  4
+	//    cv 0x34_3b_7261626f6f46   0x466f6f626172_3b_34
+	//    mv 0x00_80_000000000000   0x000000000000_80_00
+	//     m 0x00_00_ffffffffffff   0xffffffffffff_00_00
+	//  bpos                   55                     48
+	//   adv                    7                      7
+	//
+	//
+	cs = s;
 
-		h = hash_setup();
-
-		p = s;
-		while ((size_t)(e - p) >= sizeof(uint64_t)) {
-			cv = load64(p);		/* unaligned accesses here! */
-
-			//
-			// return a mask with 80 where a semicolon is
-			//
-			// Input: 'Foobar;4'
-			// Need to advance 6
-			//                         LE                     BE
-			//          4  ;  r a b o o F      F o o b a r  ;  4
-			//    cv 0x34_3b_7261626f6f46   0x466f6f626172_3b_34
-			//    mv 0x00_80_000000000000   0x000000000000_80_00
-			//     m 0x00_00_ffffffffffff   0xffffffffffff_00_00
-			//  bpos                   55                     48
-			//   adv                    7                      7
-			//
-			mv = zbyte_mangle(cv ^ SEMICOLONS);
-			if (mv) {
-				cs = s;
-				s = p;
-
-				bpos = zbyte_bpos(mv);
-				adv = zbyte_bpos_to_adv(bpos);
-				if (adv) {
-					m = zbyte_mask_from_bpos(bpos);
-					h = hash_update(h, cv & m);
-					s += adv;
-				}
-
-				ce = s++;
-
-				goto next_name;
-			}
-
-			p += sizeof(uint64_t);
-			h = hash_update(h, cv);
-		}
-
-		/* slow path fall-back */
-		cs = s;
-		/* at the end */
-		wpos = 0;
-		cv = 0;
-		h = hash_setup();
-		OOB();
-		while ((c = *s++) != ';') {
-			if (wpos == 0)
-				cv = 0;
-			cv = set_char_at_pos(cv, c, wpos);
-			if (++wpos >= sizeof(uint64_t)) {
-				h = hash_update(h, cv);
-				wpos = 0;
-			}
-			OOB();
-		}
-		if (wpos > 0)
-			h = hash_update(h, cv & pos_mask(wpos));
-		ce = s - 1;
-next_name:
-
-		OOB();
-		/* negative sign */
-		c = *s;
-		if (c == '-') {
-			neg = -1;
-			s++;
-			OOB();
-		} else
-			neg = 1;
-
-		/* scan forward for the newline, note that can only be max XX.X\n so... */
-		ns = s;
-		if ((e - s) >= sizeof(uint32_t)) {
-			nv = load32(s);	/* unaligned accesses here! */
-
-			nmv = zbyte_mangle_u32(nv ^ NEWLINES_U32);
-			if (nmv) {
-				bpos = zbyte_bpos_u32(nmv);
-				nv &= zbyte_mask_from_bpos_u32(bpos);
-				adv = zbyte_bpos_to_adv(bpos);
-				s += adv;
-			} else
-				s += sizeof(uint32_t); /* no newline, it's a full 4 bytes */
-			ne = s++;
-			ASSERT(s >= e || s[-1] == '\n');
-			goto next_temp;
-		}
-
-		/* fallback slow path */
-		wpos = 0;
-		nv = 0;
-		OOB();
-		while ((c = *s++) != '\n') {
-			if (wpos == 0)
-				nv = 0;
-			nv = set_char_at_pos_u32(nv, c, wpos);
-			if (++wpos >= sizeof(uint32_t))
-				wpos = 0;
-			OOB();
-		}
-		ne = s;
-		if (c == '\n')
-			ne--;
-next_temp:
-
-		ASSERT((ne - ns) <= 4);
-
-		/* convert 3 digit form to 4 digit form */
-		nlen = (size_t)(ne - ns);
-		ASSERT(nlen == 3 || nlen == 4);
-		// 3: 00011 << 2 -> 01100 & 8 -> 01000 = 8
-		// 4: 00100 << 2 -> 10000 & 8 -> 00000 = 0
-		nv <<= (nlen << 2) & 0x08;
-		/* neg = -1 or 1 */
-		tempi = parse_temp(nv) * neg;
-
-		// printf("%.*s;%s%.*s - %d 0x%016lx 0x%03x\n", (int)(ce - cs), cs, neg ? "-" : "", (int)(ne - ns), ns, (int)(ne - ns), nv, dm);
-
-#ifdef CHECKS
-		wb_check_parse(line, e, cs, (size_t)(ce - cs), ns, (size_t)(ne - ns), h);
-#endif
-
-		cd = wb_lookup_or_create_city(wb, cs, (size_t)(ce - cs), h);
-		ASSERT(cd);
-
-		// printf("> %.*s %3.1f\n", (int)(size_t)(ce - cs), cs, (float)tempi / 10.0);
-
-		cd->count++;
-		cd->sumt += tempi;
-		if (tempi < cd->mint)
-			cd->mint = tempi;
-		if (tempi > cd->maxt)
-			cd->maxt = tempi;
+	for (;;) {
+		cv = check ? load64_guard(s, e, SEMICOLONS) : load64(s);
+		mv = zbyte_mangle(cv ^ SEMICOLONS);
+		if (mv)
+			break;
+		h = hash_update(h, cv);
+		s += sizeof(uint64_t);
 	}
 
-#undef OOB
+	bpos = zbyte_bpos(mv);
+	adv = zbyte_bpos_to_adv(bpos);
+	if (adv) {
+		m = zbyte_mask_from_bpos(bpos);
+		h = hash_update(h, cv & m);
+		s += adv;
+	}
+	OOB();
+	ce = s++;
+
+#ifdef CHECKS
+	if (s >= e)
+		return e;
+#endif
+
+	OOB();
+	/* negative sign */
+	c = *s;
+	if (c == '-') {
+		neg = -1;
+		s++;
+		OOB();
+	} else
+		neg = 1;
+
+	/* scan forward for the newline, note that can only be max XX.X\n so... */
+	ns = s;
+	ASSERT((e - s) >= sizeof(uint32_t));
+
+	nv = load32(s);	/* unaligned accesses here! */
+
+	nmv = zbyte_mangle_u32(nv ^ NEWLINES_U32);
+	if (nmv) {
+		bpos = zbyte_bpos_u32(nmv);
+		nv &= zbyte_mask_from_bpos_u32(bpos);
+		adv = zbyte_bpos_to_adv(bpos);
+		s += adv;
+	} else
+		s += sizeof(uint32_t); /* no newline, it's a full 4 bytes */
+	ne = s++;
+
+	ASSERT(s >= e || s[-1] == '\n');
+	nlen = (size_t)(ne - ns);
+
+	ASSERT(nlen == 3 || nlen == 4);
+	/* convert 3 digit form to 4 digit form */
+	// 3: 00011 << 2 -> 01100 & 8 -> 01000 = 8
+	// 4: 00100 << 2 -> 10000 & 8 -> 00000 = 0
+	nv <<= (nlen << 2) & 0x08;
+	/* neg = -1 or 1 */
+	tempi = parse_temp(nv) * neg;
+
+	// printf("%.*s;%s%.*s - %d 0x%016lx 0x%03x\n", (int)(ce - cs), cs, neg ? "-" : "", (int)(ne - ns), ns, (int)(ne - ns), nv, dm);
+
+#ifdef CHECKS
+	wb_check_parse(0, e, cs, (size_t)(ce - cs), ns, (size_t)(ne - ns), h);
+#endif
+
+	cd = wb_lookup_or_create_city(wb, cs, (size_t)(ce - cs), h);
+	ASSERT(cd);
+
+	// printf("> %.*s %3.1f\n", (int)(size_t)(ce - cs), cs, (float)tempi / 10.0);
+
+	cd->count++;
+	cd->sumt += tempi;
+	if (tempi < cd->mint)
+		cd->mint = tempi;
+	if (tempi > cd->maxt)
+		cd->maxt = tempi;
+
+	return s;
+}
+
+static int wb_process_actual(struct work_block *wb)
+{
+	const char *s, *e;
+
+	s = wb->wd->start + wb->offset;
+	e = s + wb->size;
+
+	madvise((void *)s, (size_t)(e - s), MADV_SEQUENTIAL | MADV_WILLNEED);
+
+	/* while we're safe, conditions out bound limits */
+	while ((e - s) >= MAX_LINE_SIZE)
+		s = wb_parse_line(wb, s, e, false);
+
+	while (s < e)
+		s = wb_parse_line(wb, s, e, true);
 
 	return 0;
 }
+
+#undef OOB
 
 int wb_process(struct work_block *wb);
 
@@ -624,7 +542,6 @@ static void *wb_thread_start(void *arg)
 {
 	struct work_block *wb = arg;
 
-	// printf("processing. %p\n", wb);
 	wb_process(wb);
 	return NULL;
 }
