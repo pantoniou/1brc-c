@@ -404,8 +404,31 @@ void wb_check_parse(long line, const char *e, const char *cs, size_t clen, const
 #define OOB() do { if (s > e) abort(); } while(0)
 #endif
 
+#define VSTR(_v) \
+	({ \
+	 	uint64_t __v = (_v); \
+	 	char *_buf = alloca(2 * 8 + 1); \
+		char _c, *_s; \
+		int _i; \
+		for (_i = 0, _s = _buf; _i < 8; _i++) { \
+			_c = ((char *)&__v)[_i]; \
+			if (_c == '\n') { \
+				*_s++ = '\\'; \
+				*_s++ = 'n'; \
+			} else if (_c == '"') { \
+				*_s++ = '\\'; \
+				*_s++ = '"'; \
+			} else \
+				*_s++ = _c; \
+		} \
+		*_s = '\0'; \
+	 	_buf; \
+	})
+
 ALWAYS_INLINE const char *
-wb_parse_line(struct work_block *wb, const char *s, const char *e, bool check)
+wb_parse_line(struct work_block *wb,
+	      const char *s, const char *e,
+	      const bool check)
 {
 	struct city_data *cd;
 	const char *cs, *ce;
@@ -413,11 +436,9 @@ wb_parse_line(struct work_block *wb, const char *s, const char *e, bool check)
 	size_t nlen;
 	char c;
 	int16_t neg, tempi;
-	uint64_t cv, h, mv, m;
+	uint64_t cv, tv, h, mv, m;
 	uint32_t nv, nmv;
-	int bpos, adv;
-
-	h = hash_setup();
+	int bpos, adv, have, minus_mult;
 
 	//
 	// Input: 'Foobar;4'
@@ -433,6 +454,7 @@ wb_parse_line(struct work_block *wb, const char *s, const char *e, bool check)
 	//
 	cs = s;
 
+	h = hash_setup();
 	for (;;) {
 		cv = check ? load64_guard(s, e, SEMICOLONS) : load64(s);
 		mv = zbyte_mangle(cv ^ SEMICOLONS);
@@ -452,14 +474,80 @@ wb_parse_line(struct work_block *wb, const char *s, const char *e, bool check)
 	OOB();
 	ce = s++;
 
-#ifdef CHECKS
-	if (s >= e)
-		return e;
+#if 1
+	/* skip over the consumed city part + semicolon */
+	cv >>= (adv + 1) << 3;
+
+	/* how many bytes we have that are valid */
+	have = 8 - (adv + 1);
+
+	/* shift in any partial */
+	if (have < MAX_TEMP_BYTES) {
+		tv = check ? load64_guard(s + have, e, NEWLINES) : load64(s + have);
+		cv |= tv << (have << 3);
+	}
+
+	/*
+	 * Sign multiplier:
+	 * Get either ..00000001 (1) or ..11111111 (-1)
+	 * the minus sign is ascii 0x2d while all digits are 0x30-0x39
+	 * so for '-' bit 4 is 0, while for digits it is 1
+	 *
+	 *                 minus digit(3x)
+	 *              -------- ---------
+	 * original     00101101  0011xxxx
+	 * mask-out     00000000  00010000
+	 * shift-right  00000000  00000001
+	 * subtract 1   11111111  00000000
+	 * or 1         11111111  00000001
+	 * result             -1         1
+	 */
+
+	/* get the 4th bit to the 0 position */
+	tv = (cv & 0x10) >> 4;
+
+	/* shift out the minus */
+	cv >>= ((~cv & 0x10) >> 1);
+	tv -= 1;
+	tv |= 1;
+	minus_mult = (int)tv;
+
+	/*
+	 * Convert 4 byte form to 3 byte form
+	 * If it is 3 byte form the second byte
+	 * is '.' with value 0x2e. Similarly with '-'
+	 * the 4'th bit of that value is 0.
+	 *
+	 *             4 bytes  3 bytes
+	 *             -------  --------
+	 * original    3x3x2E3x 3x2E3xyy
+	 * tv          00000000 00100000
+	 * shift-left         0        8
+	 * result      3x3x2e3x 003x2e3x
+	 *
+	 * Note that the high byte for 3 bytes is now 00 not 30
+	 */
+
+	tv = ~cv & (1 << 12);
+	cv <<= (tv >> 9);
+
+	/* the low 32bits of the cv contains the temp */
+
+	/* calculate */
+	tempi = (((uint32_t)cv & 0x0f000f0f) *
+		 (uint64_t)(1 + (10 << 16) + (100 << 24)) >> 24) & ((1 << 10) - 1);
+	tempi *= minus_mult;
+
+	fprintf(stderr, "cv=%s minus_mult=%d tempi = %3.1f\n", VSTR(cv), minus_mult, (float)tempi * 0.1);
+
+	// printf("%.*s;%s%.*s - %d 0x%016lx 0x%03x\n", (int)(ce - cs), cs, neg ? "-" : "", (int)(ne - ns), ns, (int)(ne - ns), nv, dm);
 #endif
 
 	OOB();
 	/* negative sign */
 	c = *s;
+	ASSERT(c == '-' || isdigit(c));
+
 	if (c == '-') {
 		neg = -1;
 		s++;
@@ -471,6 +559,7 @@ wb_parse_line(struct work_block *wb, const char *s, const char *e, bool check)
 	ns = s;
 	ASSERT((e - s) >= sizeof(uint32_t));
 
+	OOB();
 	nv = load32(s);	/* unaligned accesses here! */
 
 	nmv = zbyte_mangle_u32(nv ^ NEWLINES_U32);

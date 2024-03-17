@@ -5,7 +5,7 @@ CC=gcc
 # CFLAGS=-O1 -Wall -g -fsanitize=address -fno-omit-frame-pointer -DCHECKS 
 # CFLAGS=-O3 -Wall -march=native -mtune=native -flto
 # CFLAGS=-O2 -Wall -g -fno-omit-frame-pointer
-CFLAGS=-O2 -Wall -g
+CFLAGS=-O2 -Wall -g -fno-sanitize=address
 
 all: 1brc-c
 
