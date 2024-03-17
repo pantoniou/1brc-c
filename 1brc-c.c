@@ -28,7 +28,7 @@
 #define MAX_STATION_BYTES	100
 #define MAX_STATION_COUNT	10000
 #define MAX_TEMP_BYTES		(1 + 4)	/* -99.9 */
-#define MAX_LINE_SIZE		(MAX_STATION_BYTES + 1 + MAX_TEMP_BYTES + 1)
+#define MAX_LINE_SIZE		(MAX_STATION_BYTES + 1 + MAX_TEMP_BYTES + 1)	/* fits in 1 byte */
 
 #define ALWAYS_INLINE		static inline __attribute__((always_inline))
 
@@ -431,14 +431,13 @@ wb_parse_line(struct work_block *wb,
 	      const bool check)
 {
 	struct city_data *cd;
-	const char *cs, *ce;
-	const char *ns, *ne;
-	size_t nlen;
-	char c;
-	int16_t neg, tempi;
+	const char *cs;
+	int16_t tempi;
 	uint64_t cv, tv, h, mv, m;
-	uint32_t nv, nmv;
 	int bpos, adv, have, minus_mult;
+	size_t clen;
+
+	// fprintf(stderr, "start: %s\n", VSTR(load64_guard(s, e, SEMICOLONS)));
 
 	//
 	// Input: 'Foobar;4'
@@ -456,30 +455,214 @@ wb_parse_line(struct work_block *wb,
 
 	h = hash_setup();
 	for (;;) {
+		// fprintf(stderr, "load: %s\n", VSTR(load64_guard(s, e, SEMICOLONS)));
+
+		/* load a 64 bit value (guarding if needed) */
 		cv = check ? load64_guard(s, e, SEMICOLONS) : load64(s);
+		/* make a 0 byte appear where a semicolon exists */
 		mv = zbyte_mangle(cv ^ SEMICOLONS);
 		if (mv)
-			break;
+			break; /* break out when a semicolon is found */
 		h = hash_update(h, cv);
 		s += sizeof(uint64_t);
 	}
 
+	/* find the bit position of the semicoon */
 	bpos = zbyte_bpos(mv);
+	/* convert it to a byte advance number */
 	adv = zbyte_bpos_to_adv(bpos);
+
+	// fprintf(stderr, "found bpos=%d, adv=%d\n", bpos, adv);
+
+	/* if it's 0, it means that we don't have to advance */
 	if (adv) {
 		m = zbyte_mask_from_bpos(bpos);
+		/* mask out the non city part */
 		h = hash_update(h, cv & m);
 		s += adv;
 	}
-	OOB();
-	ce = s++;
+
+	clen = (size_t)(s - cs);
+
+	s++;	/* over the ';' */
 
 #if 1
-	/* skip over the consumed city part + semicolon */
-	cv >>= (adv + 1) << 3;
+	/* how many bytes we have that are valid */
+	have = 8 - (adv + 1);
+
+	// fprintf(stderr, "have=%d, cv=%s\n", have, VSTR(cv));
+
+	if (have) {
+		/* skip over the consumed city part + semicolon */
+		cv >>= (adv + 1) << 3;
+
+		/* shift in any partial */
+		if (have < MAX_TEMP_BYTES) {
+			tv = check ? load64_guard(s + have, e, NEWLINES) : load64(s + have);
+			cv |= tv << (have << 3);
+		}
+	} else {
+		cv = check ? load64_guard(s, e, NEWLINES) : load64(s);
+	}
+
+	/*
+	 * Sign multiplier:
+	 * Get either ..00000001 (1) or ..11111111 (-1)
+	 * the minus sign is ascii 0x2d while all digits are 0x30-0x39
+	 * so for '-' bit 4 is 0, while for digits it is 1
+	 *
+	 *                 minus digit(3x)
+	 *              -------- ---------
+	 * original     00101101  0011xxxx
+	 * mask-out     00000000  00010000
+	 * shift-right  00000000  00000001
+	 * subtract 1   11111111  00000000
+	 * or 1         11111111  00000001
+	 * result             -1         1
+	 */
+
+	/* get the 4th bit to the 0 position */
+	tv = (cv & 0x10) >> 4;
+
+	/* shift out the minus */
+	cv >>= ((~cv & 0x10) >> 1);
+
+	tv -= 1;
+	tv |= 1;
+	minus_mult = (int)tv;
+
+	/*
+	 * Convert 4 byte form to 3 byte form
+	 * If it is 3 byte form the second byte
+	 * is '.' with value 0x2e. Similarly with '-'
+	 * the 4'th bit of that value is 0.
+	 *
+	 *             4 bytes  3 bytes
+	 *             -------  --------
+	 * original    3x3x2E3x 3x2E3xyy
+	 * tv          00000000 00100000
+	 * shift-left         0        8
+	 * result      3x3x2e3x 003x2e3x
+	 *
+	 * Note that the high byte for 3 bytes is now 00 not 30
+	 */
+
+	tv = ~cv & (1 << 12);
+	cv <<= (tv >> 9);
+
+	/* advance pointer by the amount required */
+	adv = ((unsigned int)minus_mult >> (sizeof(minus_mult) * 8 - 1));
+	// fprintf(stderr, "minus adv=%d\n", adv);
+
+       	adv += 3;
+	// fprintf(stderr, "base adv=%d\n", adv);
+
+	/* if 4 byte form the lowest byte is some kind of 3x (bit 4 set) */
+       	adv += (cv >> 4) & 1;
+	adv += 1;
+	// fprintf(stderr, "final adv=%d\n", adv);
+
+	/* the low 32bits of the cv contains the temp */
+
+	/* calculate */
+	tempi = (((uint32_t)cv & 0x0f000f0f) *
+		 (uint64_t)(1 + (10 << 16) + (100 << 24)) >> 24) & ((1 << 10) - 1);
+	tempi *= minus_mult;
+
+	// fprintf(stderr, "%.*s;%3.1f clen=%zu adv=%d\n", (int)clen, cs, (float)tempi * 0.1, clen, adv);
+
+	s += adv;
+
+	assert(s[-1] == '\n');
+
+#endif
+
+	cd = wb_lookup_or_create_city(wb, cs, clen, h);
+	ASSERT(cd);
+
+	cd->count++;
+	cd->sumt += tempi;
+	if (tempi < cd->mint)
+		cd->mint = tempi;
+	if (tempi > cd->maxt)
+		cd->maxt = tempi;
+
+	return s;
+}
+
+struct parse_line_info {
+	uint64_t h;
+	int16_t temp;
+	uint8_t clen;
+	uint8_t advance;
+};
+
+ALWAYS_INLINE struct parse_line_info
+parse_line(const char *start, size_t len, const bool check)
+{
+	struct parse_line_info r;
+	const char *s, *e;
+	uint64_t cv, tv, mv, m;
+	int bpos, adv, have, minus_mult;
+
+	//
+	// Input: 'Foobar;4'
+	// Need to advance 6
+	//                         LE                     BE
+	//          4  ;  r a b o o F      F o o b a r  ;  4
+	//    cv 0x34_3b_7261626f6f46   0x466f6f626172_3b_34
+	//    mv 0x00_80_000000000000   0x000000000000_80_00
+	//     m 0x00_00_ffffffffffff   0xffffffffffff_00_00
+	//  bpos                   55                     48
+	//   adv                    7                      7
+	//
+	//
+	s = start;
+	e = start + len;
+
+	r.h = hash_setup();
+	for (;;) {
+		// fprintf(stderr, "load: %s\n", VSTR(load64_guard(s, e, SEMICOLONS)));
+
+		/* load a 64 bit value (guarding if needed) */
+		cv = check ? load64_guard(s, e, SEMICOLONS) : load64(s);
+		/* make a 0 byte appear where a semicolon exists */
+		mv = zbyte_mangle(cv ^ SEMICOLONS);
+		if (mv)
+			break; /* break out when a semicolon is found */
+		r.h = hash_update(r.h, cv);
+		s += sizeof(uint64_t);
+	}
+
+	/* find the bit position of the semicoon */
+	bpos = zbyte_bpos(mv);
+	/* convert it to a byte advance number */
+	adv = zbyte_bpos_to_adv(bpos);
+
+	// fprintf(stderr, "found bpos=%d, adv=%d\n", bpos, adv);
+
+	/* if it's 0, it means that we don't have to advance */
+	if (adv) {
+		m = zbyte_mask_from_bpos(bpos);
+		/* mask out the non city part */
+		r.h = hash_update(r.h, cv & m);
+		s += adv;
+	}
+
+	r.clen = (size_t)(s - start);
+
+	s++;	/* over the ';' */
 
 	/* how many bytes we have that are valid */
 	have = 8 - (adv + 1);
+
+	// fprintf(stderr, "have=%d, cv=%s\n", have, VSTR(cv));
+
+	/* must be done in two steps, because if adv == 8
+	 * we need to shift out the entire content
+	 */
+	cv >>= 8;
+	cv >>= (adv << 3);
 
 	/* shift in any partial */
 	if (have < MAX_TEMP_BYTES) {
@@ -506,8 +689,11 @@ wb_parse_line(struct work_block *wb,
 	/* get the 4th bit to the 0 position */
 	tv = (cv & 0x10) >> 4;
 
+	adv = (int)(tv ^ 1);
+
 	/* shift out the minus */
 	cv >>= ((~cv & 0x10) >> 1);
+
 	tv -= 1;
 	tv |= 1;
 	minus_mult = (int)tv;
@@ -531,80 +717,33 @@ wb_parse_line(struct work_block *wb,
 	tv = ~cv & (1 << 12);
 	cv <<= (tv >> 9);
 
+	/* advance pointer by the amount required */
+	// adv = ((unsigned int)minus_mult >> (sizeof(minus_mult) * 8 - 1));
+	// fprintf(stderr, "minus adv=%d\n", adv);
+
+       	adv += 3;
+	// fprintf(stderr, "base adv=%d\n", adv);
+
+	/* if 4 byte form the lowest byte is some kind of 3x (bit 4 set) */
+       	adv += (cv >> 4) & 1;
+	adv += 1;
+	// fprintf(stderr, "final adv=%d\n", adv);
+
 	/* the low 32bits of the cv contains the temp */
 
 	/* calculate */
-	tempi = (((uint32_t)cv & 0x0f000f0f) *
+	r.temp = (((uint32_t)cv & 0x0f000f0f) *
 		 (uint64_t)(1 + (10 << 16) + (100 << 24)) >> 24) & ((1 << 10) - 1);
-	tempi *= minus_mult;
+	r.temp *= minus_mult;
 
-	fprintf(stderr, "cv=%s minus_mult=%d tempi = %3.1f\n", VSTR(cv), minus_mult, (float)tempi * 0.1);
+	s += adv;
 
-	// printf("%.*s;%s%.*s - %d 0x%016lx 0x%03x\n", (int)(ce - cs), cs, neg ? "-" : "", (int)(ne - ns), ns, (int)(ne - ns), nv, dm);
-#endif
+	r.advance = (uint8_t)(s - start);
 
-	OOB();
-	/* negative sign */
-	c = *s;
-	ASSERT(c == '-' || isdigit(c));
-
-	if (c == '-') {
-		neg = -1;
-		s++;
-		OOB();
-	} else
-		neg = 1;
-
-	/* scan forward for the newline, note that can only be max XX.X\n so... */
-	ns = s;
-	ASSERT((e - s) >= sizeof(uint32_t));
-
-	OOB();
-	nv = load32(s);	/* unaligned accesses here! */
-
-	nmv = zbyte_mangle_u32(nv ^ NEWLINES_U32);
-	if (nmv) {
-		bpos = zbyte_bpos_u32(nmv);
-		nv &= zbyte_mask_from_bpos_u32(bpos);
-		adv = zbyte_bpos_to_adv(bpos);
-		s += adv;
-	} else
-		s += sizeof(uint32_t); /* no newline, it's a full 4 bytes */
-	ne = s++;
-
-	ASSERT(s >= e || s[-1] == '\n');
-	nlen = (size_t)(ne - ns);
-
-	ASSERT(nlen == 3 || nlen == 4);
-	/* convert 3 digit form to 4 digit form */
-	// 3: 00011 << 2 -> 01100 & 8 -> 01000 = 8
-	// 4: 00100 << 2 -> 10000 & 8 -> 00000 = 0
-	nv <<= (nlen << 2) & 0x08;
-	/* neg = -1 or 1 */
-	tempi = parse_temp(nv) * neg;
-
-	// printf("%.*s;%s%.*s - %d 0x%016lx 0x%03x\n", (int)(ce - cs), cs, neg ? "-" : "", (int)(ne - ns), ns, (int)(ne - ns), nv, dm);
-
-#ifdef CHECKS
-	wb_check_parse(0, e, cs, (size_t)(ce - cs), ns, (size_t)(ne - ns), h);
-#endif
-
-	cd = wb_lookup_or_create_city(wb, cs, (size_t)(ce - cs), h);
-	ASSERT(cd);
-
-	// printf("> %.*s %3.1f\n", (int)(size_t)(ce - cs), cs, (float)tempi / 10.0);
-
-	cd->count++;
-	cd->sumt += tempi;
-	if (tempi < cd->mint)
-		cd->mint = tempi;
-	if (tempi > cd->maxt)
-		cd->maxt = tempi;
-
-	return s;
+	return r;
 }
 
-static int wb_process_actual(struct work_block *wb)
+int wb_process_actual(struct work_block *wb)
 {
 	const char *s, *e;
 
@@ -619,6 +758,52 @@ static int wb_process_actual(struct work_block *wb)
 
 	while (s < e)
 		s = wb_parse_line(wb, s, e, true);
+
+	return 0;
+}
+
+ALWAYS_INLINE void
+use_result(struct work_block *wb, struct parse_line_info r, const char *s)
+{
+	struct city_data *cd;
+
+	cd = wb_lookup_or_create_city(wb, s, r.clen, r.h);
+	ASSERT(cd);
+
+	cd->count++;
+	cd->sumt += r.temp;
+	if (r.temp < cd->mint)
+		cd->mint = r.temp;
+	if (r.temp > cd->maxt)
+		cd->maxt = r.temp;
+}
+
+int wb_process_actual2(struct work_block *wb)
+{
+	const char *s, *e;
+	size_t len;
+	struct parse_line_info r;
+
+	s = wb->wd->start + wb->offset;
+	e = s + wb->size;
+
+	madvise((void *)s, (size_t)(e - s), MADV_SEQUENTIAL | MADV_WILLNEED);
+
+	/* while we're safe, conditions out bound limits */
+	len = (size_t)(e - s);
+	while (len >= MAX_LINE_SIZE) {
+		r = parse_line(s, len, false);
+		use_result(wb, r, s);
+		s += r.advance;
+		len -= r.advance;
+	}
+
+	while (len > 0) {
+		r = parse_line(s, len, false);
+		use_result(wb, r, s);
+		s += r.advance;
+		len -= r.advance;
+	}
 
 	return 0;
 }
@@ -668,7 +853,8 @@ int wb_process(struct work_block *wb)
 
 	/* if there are no children, or too small we have to do the work */
 	if (nchildren <= 1 || wb->size < pagesz)
-		return wb_process_actual(wb);
+		// return wb_process_actual(wb);
+		return wb_process_actual2(wb);
 
 	s = wb->wd->start + wb->offset;
 	e = s + wb->size;
