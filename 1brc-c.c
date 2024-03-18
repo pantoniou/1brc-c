@@ -127,33 +127,6 @@ ALWAYS_INLINE uint64_t zbyte_mask_from_bpos(int bpos)
 #endif
 }
 
-ALWAYS_INLINE uint32_t zbyte_mangle_u32(uint32_t x)
-{
-	uint32_t y;
-						// Original byte: 00 80 other
-	y = (x & 0x7F7F7F7FU) + 0x7F7F7F7FU;	// 7F 7F 1xxxxxxx
-	y = ~(y | x | 0x7F7F7F7FU);		// 80 00 00000000
-	return y;
-}
-
-ALWAYS_INLINE int zbyte_bpos_u32(uint32_t mv)
-{
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-	return __builtin_ctz((int)mv);
-#else
-	return __builtin_clz((int)mv);
-#endif
-}
-
-ALWAYS_INLINE uint32_t zbyte_mask_from_bpos_u32(int bpos)
-{
-#if __BYTE_ORDER == __LITTLE_ENDIAN
-	return (((uint32_t)-1) >> (32 - (bpos - 7)));
-#else
-	return (((uint32_t)-1) << (32 - bpos));
-#endif
-}
-
 ALWAYS_INLINE uint64_t set_char_at_pos(uint64_t v, char c, int pos)
 {
 #if __BYTE_ORDER == __LITTLE_ENDIAN
@@ -161,15 +134,6 @@ ALWAYS_INLINE uint64_t set_char_at_pos(uint64_t v, char c, int pos)
 #else
 	return v | (((uint64_t)(uint8_t)c) << ((7 - pos) << 3));
 #endif
-}
-
-ALWAYS_INLINE int16_t parse_temp(uint32_t nv)
-{
-#if __BYTE_ORDER != __LITTLE_ENDIAN
-	/* the following magic calculation only works in little endian */
-	nv = __builtin_bswap16(nv);
-#endif
-	return ((nv & 0x0f000f0f) * (uint64_t)(1 + (10 << 16) + (100 << 24)) >> 24) & ((1 << 10) - 1);
 }
 
 #ifdef HASH_MURMUR
@@ -239,6 +203,7 @@ struct weather_data {
 #define WDF_VERBOSE	1
 #define WDF_TIMINGS	2
 #define WDF_BENCH	4
+#define WDF_REFERENCE	8
 
 struct weather_data *wd_open(const char *file, int workers, unsigned int flags);
 void wd_close(struct weather_data *wd);
@@ -334,7 +299,6 @@ wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, ui
 	}
 	cdheadp = &wb->cdtab[idx];
 
-	// fprintf(stderr, "new %.*s #%u 0x%016lx\n", (int)len, name, idx, h);
 	cd = cd_create(name, len, h);
 	ASSERT(cd);
 	if (!cd)
@@ -413,199 +377,6 @@ void wb_check_parse(long line, const char *e, const char *cs, size_t clen, const
 	ASSERT(vne == ne);
 }
 
-#undef OOB
-#ifndef CHECKS
-#define OOB() do { /* nothing */ } while(0)
-#else
-#define OOB() do { if (s > e) abort(); } while(0)
-#endif
-
-#define VSTR(_v) \
-	({ \
-	 	uint64_t __v = (_v); \
-	 	char *_buf = alloca(2 * 8 + 1); \
-		char _c, *_s; \
-		int _i; \
-		for (_i = 0, _s = _buf; _i < 8; _i++) { \
-			_c = ((char *)&__v)[_i]; \
-			if (_c == '\n') { \
-				*_s++ = '\\'; \
-				*_s++ = 'n'; \
-			} else if (_c == '"') { \
-				*_s++ = '\\'; \
-				*_s++ = '"'; \
-			} else \
-				*_s++ = _c; \
-		} \
-		*_s = '\0'; \
-	 	_buf; \
-	})
-
-ALWAYS_INLINE const char *
-wb_parse_line(struct work_block *wb,
-	      const char *s, const char *e,
-	      const bool check)
-{
-	struct city_data *cd;
-	const char *cs;
-	int16_t tempi;
-	uint64_t cv, tv, h, mv, m;
-	int bpos, adv, have, minus_mult;
-	size_t clen;
-
-	// fprintf(stderr, "start: %s\n", VSTR(load64_guard(s, e, SEMICOLONS)));
-
-	//
-	// Input: 'Foobar;4'
-	// Need to advance 6
-	//                         LE                     BE
-	//          4  ;  r a b o o F      F o o b a r  ;  4
-	//    cv 0x34_3b_7261626f6f46   0x466f6f626172_3b_34
-	//    mv 0x00_80_000000000000   0x000000000000_80_00
-	//     m 0x00_00_ffffffffffff   0xffffffffffff_00_00
-	//  bpos                   55                     48
-	//   adv                    7                      7
-	//
-	//
-	cs = s;
-
-	h = hash_setup();
-	for (;;) {
-		// fprintf(stderr, "load: %s\n", VSTR(load64_guard(s, e, SEMICOLONS)));
-
-		/* load a 64 bit value (guarding if needed) */
-		cv = load64_check(s, e, SEMICOLONS, check);
-		/* make a 0 byte appear where a semicolon exists */
-		mv = zbyte_mangle(cv ^ SEMICOLONS);
-		if (mv)
-			break; /* break out when a semicolon is found */
-		h = hash_update(h, cv);
-		s += sizeof(uint64_t);
-	}
-
-	/* find the bit position of the semicoon */
-	bpos = zbyte_bpos(mv);
-	/* convert it to a byte advance number */
-	adv = zbyte_bpos_to_adv(bpos);
-
-	// fprintf(stderr, "found bpos=%d, adv=%d\n", bpos, adv);
-
-	/* if it's 0, it means that we don't have to advance */
-	if (adv) {
-		m = zbyte_mask_from_bpos(bpos);
-		/* mask out the non city part */
-		h = hash_update(h, cv & m);
-		s += adv;
-	}
-
-	clen = (size_t)(s - cs);
-
-	s++;	/* over the ';' */
-
-#if 1
-	/* how many bytes we have that are valid */
-	have = 8 - (adv + 1);
-
-	// fprintf(stderr, "have=%d, cv=%s\n", have, VSTR(cv));
-
-	if (have) {
-		/* skip over the consumed city part + semicolon */
-		cv >>= (adv + 1) << 3;
-
-		/* shift in any partial */
-		if (have < MAX_TEMP_BYTES) {
-			tv = load64_check(s + have, e, NEWLINES, check);
-			cv |= tv << (have << 3);
-		}
-	} else {
-		cv = check ? load64_guard(s, e, NEWLINES) : load64(s);
-	}
-
-	/*
-	 * Sign multiplier:
-	 * Get either ..00000001 (1) or ..11111111 (-1)
-	 * the minus sign is ascii 0x2d while all digits are 0x30-0x39
-	 * so for '-' bit 4 is 0, while for digits it is 1
-	 *
-	 *                 minus digit(3x)
-	 *              -------- ---------
-	 * original     00101101  0011xxxx
-	 * mask-out     00000000  00010000
-	 * shift-right  00000000  00000001
-	 * subtract 1   11111111  00000000
-	 * or 1         11111111  00000001
-	 * result             -1         1
-	 */
-
-	/* get the 4th bit to the 0 position */
-	tv = (cv & 0x10) >> 4;
-
-	/* shift out the minus */
-	cv >>= ((~cv & 0x10) >> 1);
-
-	tv -= 1;
-	tv |= 1;
-	minus_mult = (int)tv;
-
-	/*
-	 * Convert 4 byte form to 3 byte form
-	 * If it is 3 byte form the second byte
-	 * is '.' with value 0x2e. Similarly with '-'
-	 * the 4'th bit of that value is 0.
-	 *
-	 *             4 bytes  3 bytes
-	 *             -------  --------
-	 * original    3x3x2E3x 3x2E3xyy
-	 * tv          00000000 00100000
-	 * shift-left         0        8
-	 * result      3x3x2e3x 003x2e3x
-	 *
-	 * Note that the high byte for 3 bytes is now 00 not 30
-	 */
-
-	tv = ~cv & (1 << 12);
-	cv <<= (tv >> 9);
-
-	/* advance pointer by the amount required */
-	adv = ((unsigned int)minus_mult >> (sizeof(minus_mult) * 8 - 1));
-	// fprintf(stderr, "minus adv=%d\n", adv);
-
-       	adv += 3;
-	// fprintf(stderr, "base adv=%d\n", adv);
-
-	/* if 4 byte form the lowest byte is some kind of 3x (bit 4 set) */
-       	adv += (cv >> 4) & 1;
-	adv += 1;
-	// fprintf(stderr, "final adv=%d\n", adv);
-
-	/* the low 32bits of the cv contains the temp */
-
-	/* calculate */
-	tempi = (((uint32_t)cv & 0x0f000f0f) *
-		 (uint64_t)(1 + (10 << 16) + (100 << 24)) >> 24) & ((1 << 10) - 1);
-	tempi *= minus_mult;
-
-	// fprintf(stderr, "%.*s;%3.1f clen=%zu adv=%d\n", (int)clen, cs, (float)tempi * 0.1, clen, adv);
-
-	s += adv;
-
-	assert(s[-1] == '\n');
-
-#endif
-
-	cd = wb_lookup_or_create_city(wb, cs, clen, h);
-	ASSERT(cd);
-
-	cd->count++;
-	cd->sumt += tempi;
-	if (tempi < cd->mint)
-		cd->mint = tempi;
-	if (tempi > cd->maxt)
-		cd->maxt = tempi;
-
-	return s;
-}
-
 struct parse_line_info {
 	uint64_t h;
 	int16_t temp;
@@ -614,135 +385,7 @@ struct parse_line_info {
 };
 
 ALWAYS_INLINE struct parse_line_info
-parse_line(const char *start, size_t len, const bool check)
-{
-	struct parse_line_info r;
-	const char *s, *e;
-	uint64_t cv, tv, mv;
-	int bpos, adv, have, minus_mult;
-
-	//
-	// Input: 'Foobar;4'
-	// Need to advance 6
-	//                         LE                     BE
-	//          4  ;  r a b o o F      F o o b a r  ;  4
-	//    cv 0x34_3b_7261626f6f46   0x466f6f626172_3b_34
-	//    mv 0x00_80_000000000000   0x000000000000_80_00
-	//     m 0x00_00_ffffffffffff   0xffffffffffff_00_00
-	//  bpos                   55                     48
-	//   adv                    7                      7
-	//
-	//
-	s = start;
-	e = start + len;
-
-	r.h = hash_setup();
-
-	while ((mv = zbyte_mangle((cv = load64_check(s, e, SEMICOLONS, check)) ^ SEMICOLONS)) == 0) {
-		r.h = hash_update(r.h, cv);
-		s += sizeof(uint64_t);
-	}
-
-	/* find the bit position of the semicoon */
-	bpos = zbyte_bpos(mv);
-	/* convert it to a byte advance number */
-	adv = zbyte_bpos_to_adv(bpos);
-	s += adv;
-
-	// fprintf(stderr, "found bpos=%d, adv=%d\n", bpos, adv);
-
-	/* if it's 0, it means that we don't have to advance */
-	if (adv)
-		r.h = hash_update(r.h, cv & zbyte_mask_from_bpos(bpos));
-
-	/* must be done in two steps, because if adv == 8 shift about is
-	 * size of the type. on most arches the shift is modulo.
-	 */
-	cv >>= 8;
-	cv >>= (adv << 3);
-
-	r.clen = (size_t)(s - start);
-
-	s++;	/* over the ';' */
-
-	/* how many bytes we have that are valid */
-	have = 8 - (adv + 1);
-
-	// fprintf(stderr, "have=%d, cv=%s\n", have, VSTR(cv));
-
-	/* shift in any partial */
-	if (have < MAX_TEMP_BYTES)
-		cv |= load64_check(s + have, e, NEWLINES, check) << (have << 3);
-
-	/*
-	 * Sign multiplier:
-	 * Get either ..00000001 (1) or ..11111111 (-1)
-	 * the minus sign is ascii 0x2d while all digits are 0x30-0x39
-	 * so for '-' bit 4 is 0, while for digits it is 1
-	 *
-	 *                 minus digit(3x)
-	 *              -------- ---------
-	 * original     00101101  0011xxxx
-	 * mask-out     00000000  00010000
-	 * shift-right  00000000  00000001
-	 * subtract 1   11111111  00000000
-	 * or 1         11111111  00000001
-	 * result             -1         1
-	 */
-
-	/* get the 4th bit to the 0 position */
-	tv = (cv & 0x10) >> 4;
-
-	adv = (int)(tv ^ 1);
-
-	/* shift out the minus */
-	cv >>= ((~cv & 0x10) >> 1);
-
-	tv -= 1;
-	tv |= 1;
-	minus_mult = (int)tv;
-
-	/*
-	 * Convert 4 byte form to 3 byte form
-	 * If it is 3 byte form the second byte
-	 * is '.' with value 0x2e. Similarly with '-'
-	 * the 4'th bit of that value is 0.
-	 *
-	 *             4 bytes  3 bytes
-	 *             -------  --------
-	 * original    3x3x2E3x 3x2E3xyy
-	 * tv          00000000 00100000
-	 * shift-left         0        8
-	 * result      3x3x2e3x 003x2e3x
-	 *
-	 * Note that the high byte for 3 bytes is now 00 not 30
-	 */
-
-	tv = ~cv & (1 << 12);
-	cv <<= (tv >> 9);
-
-       	adv += 3;
-
-	/* if 4 byte form the lowest byte is some kind of 3x (bit 4 set) */
-       	adv += (cv >> 4) & 1;
-	adv += 1;
-
-	/* the low 32bits of the cv contains the temp */
-
-	/* calculate */
-	r.temp = (((uint32_t)cv & 0x0f000f0f) *
-		 (uint64_t)(1 + (10 << 16) + (100 << 24)) >> 24) & ((1 << 10) - 1);
-	r.temp *= minus_mult;
-
-	s += adv;
-
-	r.advance = (uint8_t)(s - start);
-
-	return r;
-}
-
-ALWAYS_INLINE struct parse_line_info
-parse_line2(const char *start, const char *end, const bool check)
+parse_line(const char *start, const char *end, const bool check)
 {
 	struct parse_line_info r;
 	uint64_t cv, tv, mv;
@@ -852,33 +495,59 @@ parse_line2(const char *start, const char *end, const bool check)
 	return r;
 }
 
+ALWAYS_INLINE struct parse_line_info
+parse_line_simple(const char *start, const char *end)
+{
+	struct parse_line_info r;
+	const char *s;
+	uint64_t v;
+	int wpos;
+	char c;
+	bool minus;
+
+	s = start;
+	wpos = 0;
+	v = 0;
+	r.h = hash_setup();
+	while (s < end && (c = *s++) != ';') {
+		if (wpos == 0)
+			v = 0;
+		v = set_char_at_pos(v, c, wpos);
+		if (++wpos >= 8) {
+			r.h = hash_update(r.h, v);
+			wpos = 0;
+		}
+	}
+	if (wpos > 0)
+		r.h = hash_update(r.h, v);
+	r.clen = s - 1 - start;
+
+	minus = s < end && *s == '-';
+	if (minus)
+		s++;
+	r.temp = 0;
+	while(s < end && (c = *s++) != '\n') {
+		if (c == '.')
+			continue;
+		r.temp *= 10;
+		r.temp += c - '0';
+	}
+	if (minus)
+		r.temp = -r.temp;
+
+	r.advance = s - start;
+
+	return r;
+}
+
 __attribute__((noinline)) struct parse_line_info
 parse_line_no_inline(const char *start, const char *end)
 {
-	return parse_line2(start, end, false);
-}
-
-int wb_process_actual(struct work_block *wb)
-{
-	const char *s, *e;
-
-	s = wb->wd->start + wb->offset;
-	e = s + wb->size;
-
-	madvise((void *)s, (size_t)(e - s), MADV_SEQUENTIAL | MADV_WILLNEED);
-
-	/* while we're safe, conditions out bound limits */
-	while ((e - s) >= MAX_LINE_SIZE)
-		s = wb_parse_line(wb, s, e, false);
-
-	while (s < e)
-		s = wb_parse_line(wb, s, e, true);
-
-	return 0;
+	return parse_line(start, end, false);
 }
 
 ALWAYS_INLINE void
-use_result(struct work_block *wb, struct parse_line_info r, const char *s)
+process_result(struct work_block *wb, struct parse_line_info r, const char *s)
 {
 	struct city_data *cd;
 
@@ -893,10 +562,9 @@ use_result(struct work_block *wb, struct parse_line_info r, const char *s)
 		cd->maxt = r.temp;
 }
 
-int wb_process_actual2(struct work_block *wb)
+int wb_process_actual(struct work_block *wb)
 {
 	const char *s, *e;
-	size_t len;
 	struct parse_line_info r;
 	struct timespec tstart, tend;
 
@@ -907,20 +575,18 @@ int wb_process_actual2(struct work_block *wb)
 
 	madvise((void *)s, (size_t)(e - s), MADV_SEQUENTIAL | MADV_WILLNEED);
 
-	/* while we're safe, conditions out bound limits */
+	/* while we're safe, condition out bound limits */
 	while ((size_t)(e - s) >= MAX_LINE_SIZE) {
-		r = parse_line2(s, e, false);
-		use_result(wb, r, s);
+		r = parse_line(s, e, false);
+		process_result(wb, r, s);
 		s += r.advance;
-		len -= r.advance;
 	}
 
 	/* we need to check bounds now */
 	while (s < e) {
-		r = parse_line2(s, e, true);
-		use_result(wb, r, s);
+		r = parse_line(s, e, true);
+		process_result(wb, r, s);
 		s += r.advance;
-		len -= r.advance;
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &tend);
@@ -931,7 +597,33 @@ int wb_process_actual2(struct work_block *wb)
 	return 0;
 }
 
-#undef OOB
+int wb_process_actual_reference(struct work_block *wb)
+{
+	const char *s, *e;
+	struct parse_line_info r;
+	struct timespec tstart, tend;
+
+	clock_gettime(CLOCK_MONOTONIC, &tstart);
+
+	s = wb->wd->start + wb->offset;
+	e = s + wb->size;
+
+	madvise((void *)s, (size_t)(e - s), MADV_SEQUENTIAL | MADV_WILLNEED);
+
+	/* we need to check bounds now */
+	while (s < e) {
+		r = parse_line_simple(s, e);
+		process_result(wb, r, s);
+		s += r.advance;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &tend);
+
+	if (wb->wd->flags & WDF_TIMINGS)
+		fprintf(stderr, "%s: time=%lldns\n", __func__, delta_ns(tstart, tend));
+
+	return 0;
+}
 
 int wb_process(struct work_block *wb);
 
@@ -977,7 +669,9 @@ int wb_process(struct work_block *wb)
 
 	/* if there are no children, or too small we have to do the work */
 	if (nchildren <= 1 || wb->size < pagesz)
-		return wb_process_actual2(wb);
+		return !(wb->wd->flags & WDF_REFERENCE) ?
+				wb_process_actual(wb) :
+				wb_process_actual_reference(wb);
 
 	s = wb->wd->start + wb->offset;
 	e = s + wb->size;
@@ -1233,6 +927,7 @@ static struct option lopts[] = {
 	{"bench",		no_argument,		0,	'b' },
 	{"verbose",		no_argument,		0,	'v' },
 	{"timings",		no_argument,		0,	't' },
+	{"reference",		no_argument,		0,	'r' },
 	{"workers",		required_argument,	0,	'w' },
 	{"help",		no_argument,		0,	'h' },
 	{0,			0,              	0,	 0  },
@@ -1247,6 +942,7 @@ static void display_usage(FILE *fp)
 	fprintf(fp, "\t--bench, -b              : Bench mode (no report output)\n");
 	fprintf(fp, "\t--verbose, -v            : Verbose mode\n");
 	fprintf(fp, "\t--timings, -t            : Timing info at stderr\n");
+	fprintf(fp, "\t--reference, r           : Process using a simple reference implementation\n");
 	fprintf(fp, "\t--workers, -w <n>        : Set workers to <n>\n");
 	fprintf(fp, "\t--help, -h               : Display  help message\n");
 	fprintf(fp, "\n");
@@ -1260,7 +956,7 @@ int main(int argc, char *argv[])
 	int workers = -1;
 	unsigned int flags = 0;
 
-	while ((opt = getopt_long_only(argc, argv, "w:bvth", lopts, &lidx)) != -1) {
+	while ((opt = getopt_long_only(argc, argv, "w:bvtrh", lopts, &lidx)) != -1) {
 		switch (opt) {
 		case 'w':
 			workers = atoi(optarg);
@@ -1273,6 +969,9 @@ int main(int argc, char *argv[])
 			break;
 		case 't':
 			flags |= WDF_TIMINGS;
+			break;
+		case 'r':
+			flags |= WDF_REFERENCE;
 			break;
 		case 'h':
 		default:
