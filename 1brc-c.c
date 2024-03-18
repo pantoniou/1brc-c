@@ -177,7 +177,7 @@ struct weather_data {
 #define WDF_TIMINGS	2
 #define WDF_BENCH	4
 #define WDF_REFERENCE	8
-#define WDF_FORK	16
+#define WDF_NOFORK	16
 #define WDF_JOIN	32
 
 struct weather_data *wd_open(const char *file, int workers, unsigned int flags);
@@ -867,6 +867,7 @@ static struct option lopts[] = {
 	{"verbose",		no_argument,		0,	'v' },
 	{"timings",		no_argument,		0,	't' },
 	{"reference",		no_argument,		0,	'r' },
+	{"no-fork",		no_argument,		0,	'n' },
 	{"join",		no_argument,		0,	'j' },
 	{"workers",		required_argument,	0,	'w' },
 	{"help",		no_argument,		0,	'h' },
@@ -883,7 +884,7 @@ static void display_usage(FILE *fp)
 	fprintf(fp, "\t--verbose, -v            : Verbose mode\n");
 	fprintf(fp, "\t--timings, -t            : Timing info at stderr\n");
 	fprintf(fp, "\t--reference, r           : Process using a simple reference implementation\n");
-	fprintf(fp, "\t--fork, -f               : Fork and avoid unmap overhead\n");
+	fprintf(fp, "\t--no-fork, -n            : Do not fork (you will incur the unmap overhead)\n");
 	fprintf(fp, "\t--join, -j               : Join child after fork\n");
 	fprintf(fp, "\t--workers, -w <n>        : Set workers to <n>\n");
 	fprintf(fp, "\t--help, -h               : Display  help message\n");
@@ -905,7 +906,7 @@ int do_work(const char *file, int workers, unsigned int flags)
 	 * the child, so does not incur the cost of
 	 * unmapping the file
 	 */
-	if (flags & WDF_FORK) {
+	if (!(flags & WDF_NOFORK)) {
 
 		if (flags & WDF_VERBOSE)
 			fprintf(stderr, "Forking mode enabled\n");
@@ -964,7 +965,7 @@ int do_work(const char *file, int workers, unsigned int flags)
 	wd_report(wd);
 
 	/* if we were forked, close the stdout descriptor */
-	if (flags & WDF_FORK)
+	if (!(flags & WDF_NOFORK))
 		close(STDOUT_FILENO);
 
 	wd_close(wd);
@@ -979,7 +980,7 @@ int main(int argc, char *argv[])
 	int workers = -1;
 	unsigned int flags = 0;
 
-	while ((opt = getopt_long_only(argc, argv, "w:bvtrfjh", lopts, &lidx)) != -1) {
+	while ((opt = getopt_long_only(argc, argv, "w:bvtrnjh", lopts, &lidx)) != -1) {
 		switch (opt) {
 		case 'w':
 			workers = atoi(optarg);
@@ -996,8 +997,8 @@ int main(int argc, char *argv[])
 		case 'r':
 			flags |= WDF_REFERENCE;
 			break;
-		case 'f':
-			flags |= WDF_FORK;
+		case 'n':
+			flags |= WDF_NOFORK;
 			break;
 		case 'j':
 			flags |= WDF_JOIN;
