@@ -1,7 +1,7 @@
 #!/bin/bash
 
 failed=0
-for t in samples/*.txt; do
+for t in 1brc-java/src/test/resources/samples/*.txt; do
 	echo -n "checking $t ${t%.txt}.out ... "
 	./1brc-c $@ "$t" | diff -u - "${t%.txt}.out" >/dev/null 2>&1
 	if test $? -ne 0; then

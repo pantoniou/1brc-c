@@ -1,13 +1,12 @@
-.PHONY: all clean check
+.PHONY: all clean check run
 
 CC=gcc
-# CC=clang-15
-# CFLAGS=-O1 -Wall -g -fsanitize=address -fno-omit-frame-pointer -DCHECKS 
-# CFLAGS=-O3 -Wall -march=native -mtune=native -flto
+# CC=clang
+CFLAGS=-O3 -Wall -march=native -mtune=native -flto
 # CFLAGS=-O2 -Wall -g -fno-omit-frame-pointer
-CFLAGS=-O3 -Wall -g -fno-sanitize=address
+CFLAGS=-O3 -Wall -fno-sanitize=address
 
-all: 1brc-c
+all: run
 
 1brc-c: 1brc-c.c Makefile
 	$(CC) $(CFLAGS) -o $@ $< -lm -lpthread
@@ -16,8 +15,11 @@ clean:
 	@rm -f 1brc-c
 
 check: 1brc-c
-	@for t in samples/*.txt ; do \
-		echo $$t `basename $$t`.out; \
-	done
+	@./run-check.sh
 
-		# ./1brc-c $${t} | diff -u - $(basename 
+run: 1brc-c measurements.txt
+	/usr/bin/time -p ./1brc-c measurements.txt >/dev/null
+
+measurements.txt: create-measurements.sh
+	@./create-measurements.sh 1000000000
+
