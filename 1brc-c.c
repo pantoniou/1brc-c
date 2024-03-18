@@ -24,7 +24,12 @@
 #include <getopt.h>
 #include <alloca.h>
 #include <pthread.h>
-#include <stdatomic.h>
+#include <wait.h>
+
+/* sadly, you can't find any big endian machines anymore... */
+#if __BYTE_ORDER != __LITTLE_ENDIAN
+#error Only little endian machines supported.
+#endif
 
 static inline long long
 delta_ns(struct timespec before, struct timespec after)
@@ -42,27 +47,12 @@ delta_ns(struct timespec before, struct timespec after)
 
 #define ALWAYS_INLINE		static inline __attribute__((always_inline))
 
-// #undef CHECKS
-// #define CHECKS
-
-#ifdef CHECKS
-#define ASSERT(_x) assert(_x)
-#else
-#define ASSERT(_x) do { } while(0)
-#endif
-
 #define HASH_MURMUR
 
 ALWAYS_INLINE uint64_t load64(const void *p)
 {
 	/* most arches support this */
 	return *(const uint64_t *)p;
-}
-
-ALWAYS_INLINE uint32_t load32(const void *p)
-{
-	/* most arches support this */
-	return *(const uint32_t *)p;
 }
 
 ALWAYS_INLINE uint64_t load64_guard(const void *p, const void *e, const uint64_t guard)
@@ -89,7 +79,6 @@ ALWAYS_INLINE uint64_t load64_check(const void *p, const void *e, const uint64_t
 #define SEMICOLONS	0x3b3b3b3b3b3b3b3bLU
 #define NEWLINES	0x0a0a0a0a0a0a0a0aLU
 #define CARRYMASKS	0x7F7F7F7F7F7F7F7FLU
-#define NEWLINES_U32	0x0a0a0a0aU
 
 ALWAYS_INLINE uint64_t zbyte_mangle(uint64_t x)
 {
@@ -102,38 +91,22 @@ ALWAYS_INLINE uint64_t zbyte_mangle(uint64_t x)
 
 ALWAYS_INLINE int zbyte_bpos(uint64_t mv)
 {
-#if __BYTE_ORDER == __LITTLE_ENDIAN
 	return __builtin_ctzl((long)mv);
-#else
-	return __builtin_clzl((long)mv);
-#endif
 }
 
 ALWAYS_INLINE int zbyte_bpos_to_adv(int bpos)
 {
-#if __BYTE_ORDER == __LITTLE_ENDIAN
 	return bpos >> 3;
-#else
-	return (bpos + 1) >> 3;
-#endif
 }
 
 ALWAYS_INLINE uint64_t zbyte_mask_from_bpos(int bpos)
 {
-#if __BYTE_ORDER == __LITTLE_ENDIAN
 	return (((uint64_t)-1) >> (64 - (bpos - 7)));
-#else
-	return (((uint64_t)-1) << (64 - bpos));
-#endif
 }
 
 ALWAYS_INLINE uint64_t set_char_at_pos(uint64_t v, char c, int pos)
 {
-#if __BYTE_ORDER == __LITTLE_ENDIAN
 	return v | (((uint64_t)(uint8_t)c) << (pos << 3));
-#else
-	return v | (((uint64_t)(uint8_t)c) << ((7 - pos) << 3));
-#endif
 }
 
 #ifdef HASH_MURMUR
@@ -204,6 +177,8 @@ struct weather_data {
 #define WDF_TIMINGS	2
 #define WDF_BENCH	4
 #define WDF_REFERENCE	8
+#define WDF_FORK	16
+#define WDF_JOIN	32
 
 struct weather_data *wd_open(const char *file, int workers, unsigned int flags);
 void wd_close(struct weather_data *wd);
@@ -294,15 +269,13 @@ wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, ui
 	for (cd = wb->cdtab[idx]; cd; cd = cd->next) {
 		if (cd->h != h)
 		       continue;
-		ASSERT(cd->len == len && !memcmp(name, cd->name, len));
 		return cd;
 	}
 	cdheadp = &wb->cdtab[idx];
 
 	cd = cd_create(name, len, h);
-	ASSERT(cd);
 	if (!cd)
-		return NULL;
+		perror("cd_create");
 
 	/* link */
 	cd->next = *cdheadp;
@@ -310,71 +283,7 @@ wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, ui
 	cd->cnext = wb->create_head;
 	wb->create_head = cd;
 	wb->city_count++;
-#ifdef CHECKS
-	if (cd->next)
-		wb->collisions++;
-#endif
 	return cd;
-}
-
-void wb_check_parse(long line, const char *e, const char *cs, size_t clen, const char *ns, size_t nlen, uint64_t h)
-{
-	const char *ce, *ne;
-	const char *vs;
-	const char *vcs, *vce;
-	const char *vns, *vne;
-	uint64_t vh, v;
-	int wpos;
-	char c;
-
-	ce = cs + clen;
-	ne = ns + nlen;
-
-	vcs = cs;
-	vs = vcs;
-	wpos = 0;
-	v = 0;
-	vh = hash_setup();
-	while (vs < e && (c = *vs++) != ';') {
-		if (wpos == 0)
-			v = 0;
-		v = set_char_at_pos(v, c, wpos);
-		if (++wpos >= 8) {
-			vh = hash_update(vh, v);
-			wpos = 0;
-		}
-	}
-	if (wpos > 0)
-		vh = hash_update(vh, v);
-	vce = vs - 1;
-
-	/* verify */
-	vns = ns;
-	while (vs < e && *vs != '\n')
-		vs++;
-	vne = vs++;
-
-	if (vce != ce) {
-		fprintf(stderr, "%ld: Bad city: was '%.*s' should be '%.*s' %p/%p %p/%p\n", line,
-				(int)(ce - cs), cs, (int)(vce - vcs), vcs,
-				cs, vcs, ce, vce);
-	}
-	ASSERT(vce == ce);
-
-	if (vh != h) {
-		fprintf(stderr, "%ld: Bad hash for city '%.*s': was 0x%016lx should be 0x%016lx\n", line,
-				(int)(ce - cs), cs, vh, h);
-	}
-	ASSERT(vh == h);
-
-	if (vne != ne) {
-		fprintf(stderr, "%ld: City '%.*s'; bad temp '%.*s' should be '%.*s' %p/%p %p/%p\n", line,
-				(int)(ce - cs), cs,
-				(int)(ne - ns), ns,
-				(int)(vne - vns), vns,
-				ns, vns, ne, vne);
-	}
-	ASSERT(vne == ne);
 }
 
 struct parse_line_info {
@@ -496,7 +405,7 @@ parse_line(const char *start, const char *end, const bool check)
 }
 
 ALWAYS_INLINE struct parse_line_info
-parse_line_simple(const char *start, const char *end)
+parse_line_reference(const char *start, const char *end)
 {
 	struct parse_line_info r;
 	const char *s;
@@ -552,7 +461,6 @@ process_result(struct work_block *wb, struct parse_line_info r, const char *s)
 	struct city_data *cd;
 
 	cd = wb_lookup_or_create_city(wb, s, r.clen, r.h);
-	ASSERT(cd);
 
 	cd->count++;
 	cd->sumt += r.temp;
@@ -612,7 +520,7 @@ int wb_process_actual_reference(struct work_block *wb)
 
 	/* we need to check bounds now */
 	while (s < e) {
-		r = parse_line_simple(s, e);
+		r = parse_line_reference(s, e);
 		process_result(wb, r, s);
 		s += r.advance;
 	}
@@ -746,7 +654,6 @@ int wb_process(struct work_block *wb)
 		for (cdc = wbc->create_head; cdc; cdc = cdc->cnext) {
 
 			cd = wb_lookup_or_create_city(wb, cdc->name, cdc->len, cdc->h);
-			ASSERT(cd);
 
 			/* merge the data */
 			cd->count += cdc->count;
@@ -784,8 +691,6 @@ static int city_cmp(const void *a, const void *b)
 	const struct city_data *ca = *cap;
 	const struct city_data *cb = *cbp;
 
-	ASSERT(ca);
-	ASSERT(cb);
 	return strcmp(ca->name, cb->name);
 }
 
@@ -795,6 +700,10 @@ void wb_report(struct work_block *wb)
 	unsigned int i, count;
 	struct city_data **cdtab;
 	struct timespec tstart, tend;
+	int len, alloc, total;
+	char *wrbuf = NULL, *wrbuf2, *s;
+	bool need_to_grow;
+	ssize_t wrn;
 
 	if (!wb)
 		return;
@@ -802,32 +711,62 @@ void wb_report(struct work_block *wb)
 	clock_gettime(CLOCK_MONOTONIC, &tstart);
 
 	cdtab = malloc(sizeof(*cdtab) * wb->city_count);
-	ASSERT(cdtab);
-#ifdef CHECKS
 	if (!cdtab)
-		return;
-#endif
+		perror("malloc");
 
 	count = 0;
-	for (cd = wb->create_head; cd; cd = cd->cnext) {
-		ASSERT(count < wb->city_count);
+	for (cd = wb->create_head; cd; cd = cd->cnext)
 		cdtab[count++] = cd;
-	}
-	ASSERT(count == wb->city_count);
 
 	qsort(cdtab, count, sizeof(cdtab[0]), city_cmp);
 
+	alloc = 65536;
+	total = 0;
+	wrbuf = malloc(alloc);
+	if (wrbuf == NULL)
+		perror("malloc");
+
 	for (i = 0; i < count; i++) {
 		cd = cdtab[i];
-		printf("%s%s%s=%3.1f/%3.1f/%3.1f%s",
-				i == 0 ? "{" : "",
-				i > 0 ? ", " : "",
-				cd->name,
-				(float)cd->mint * 0.1,
-				round((float)cd->sumt / cd->count) * 0.1,
-				(float)cd->maxt * 0.1,
-				i >= (count - 1) ? "}\n" : "");
+
+		do {
+			len = snprintf(wrbuf + total, alloc - total,
+					"%s%s%s=%3.1f/%3.1f/%3.1f%s",
+					i == 0 ? "{" : "",
+					i > 0 ? ", " : "",
+					cd->name,
+					(float)cd->mint * 0.1,
+					round((float)cd->sumt / cd->count) * 0.1,
+					(float)cd->maxt * 0.1,
+					i >= (count - 1) ? "}\n" : "");
+
+			/* do we need to grow ? */
+			need_to_grow = total + len >= alloc;
+
+			if (need_to_grow) {
+				wrbuf2 = realloc(wrbuf, alloc * 2);
+				if (wrbuf2 == NULL)
+					perror("realloc");
+				alloc *= 2;
+				wrbuf = wrbuf2;
+			}
+		} while (need_to_grow);
+		total += len;
 	}
+
+	/* safe write */
+	s = wrbuf;
+	while (total > 0) {
+		do {
+			wrn = write(STDOUT_FILENO, s, total);
+		} while (wrn == -1 && errno == EAGAIN);
+		if (wrn == -1)
+			perror("write");
+		s += wrn;
+		total -= wrn;
+	}
+
+	free(wrbuf);
 
 	free(cdtab);
 
@@ -928,6 +867,7 @@ static struct option lopts[] = {
 	{"verbose",		no_argument,		0,	'v' },
 	{"timings",		no_argument,		0,	't' },
 	{"reference",		no_argument,		0,	'r' },
+	{"join",		no_argument,		0,	'j' },
 	{"workers",		required_argument,	0,	'w' },
 	{"help",		no_argument,		0,	'h' },
 	{0,			0,              	0,	 0  },
@@ -943,20 +883,103 @@ static void display_usage(FILE *fp)
 	fprintf(fp, "\t--verbose, -v            : Verbose mode\n");
 	fprintf(fp, "\t--timings, -t            : Timing info at stderr\n");
 	fprintf(fp, "\t--reference, r           : Process using a simple reference implementation\n");
+	fprintf(fp, "\t--fork, -f               : Fork and avoid unmap overhead\n");
+	fprintf(fp, "\t--join, -j               : Join child after fork\n");
 	fprintf(fp, "\t--workers, -w <n>        : Set workers to <n>\n");
 	fprintf(fp, "\t--help, -h               : Display  help message\n");
 	fprintf(fp, "\n");
 }
 
+int do_work(const char *file, int workers, unsigned int flags)
+{
+	struct timespec tstart, tend;
+	struct weather_data *wd = NULL;
+	pid_t pid = 0;
+	char buf[65536];
+	ssize_t rdn;
+	int pipefd[2] = { -1, -1 };
+	int r;
+
+	/* fork and do the work on the child
+	 * parent can exit prematurely without reaping 
+	 * the child, so does not incur the cost of
+	 * unmapping the file
+	 */
+	if (flags & WDF_FORK) {
+
+		if (flags & WDF_VERBOSE)
+			fprintf(stderr, "Forking mode enabled\n");
+
+		r = pipe(pipefd);
+		if (r == -1)
+			perror("pipe");
+		pid = fork();
+		if (pid == -1)
+			perror("fork");
+
+		if (pid > 0) {
+			close(pipefd[1]);
+
+			do {
+				do {
+					rdn = read(pipefd[0], buf, sizeof(buf));
+				} while (rdn == -1 && errno == EAGAIN);
+				if (rdn == -1)
+					perror("read error");
+				if (flags & WDF_VERBOSE)
+					fprintf(stderr, "parent read %zd bytes\n", rdn);
+				fwrite(buf, 1, rdn, stdout);
+			} while (rdn > 0);
+			close(pipefd[0]);
+
+			if (flags & WDF_JOIN) {
+				clock_gettime(CLOCK_MONOTONIC, &tstart);
+
+				waitpid(pid, NULL, 0);
+
+				clock_gettime(CLOCK_MONOTONIC, &tend);
+
+				if (flags & WDF_TIMINGS)
+					fprintf(stderr, "%s: join time=%lldns\n", __func__, delta_ns(tstart, tend));
+			}
+
+			return 0;
+		}
+		/* child, close unused read pipe */
+		close(pipefd[0]);
+
+		/* connect the other end as stdout */
+		dup2(pipefd[1], STDOUT_FILENO);
+
+		/* and close this one too */
+		close(pipefd[1]);
+	}
+
+	wd = wd_open(file, workers, flags);
+	if (!wd) {
+		fprintf(stderr, "Unable to open/process weather data file '%s': %s\n",
+				file, strerror(errno));
+		return -1;
+	}
+	wd_report(wd);
+
+	/* if we were forked, close the stdout descriptor */
+	if (flags & WDF_FORK)
+		close(STDOUT_FILENO);
+
+	wd_close(wd);
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
-	int opt, lidx;
-	struct weather_data *wd = NULL;
+	int opt, lidx, rc;
 	const char *file;
 	int workers = -1;
 	unsigned int flags = 0;
 
-	while ((opt = getopt_long_only(argc, argv, "w:bvtrh", lopts, &lidx)) != -1) {
+	while ((opt = getopt_long_only(argc, argv, "w:bvtrfjh", lopts, &lidx)) != -1) {
 		switch (opt) {
 		case 'w':
 			workers = atoi(optarg);
@@ -973,6 +996,12 @@ int main(int argc, char *argv[])
 		case 'r':
 			flags |= WDF_REFERENCE;
 			break;
+		case 'f':
+			flags |= WDF_FORK;
+			break;
+		case 'j':
+			flags |= WDF_JOIN;
+			break;
 		case 'h':
 		default:
 			if (opt != 'h')
@@ -984,15 +1013,7 @@ int main(int argc, char *argv[])
 
 	file = optind >= argc ? "measurements.txt" : argv[optind];
 
-	wd = wd_open(file, workers, flags);
-	if (!wd) {
-		fprintf(stderr, "Unable to open/process weather data file '%s': %s\n",
-				file, strerror(errno));
-		return EXIT_FAILURE;
-	}
-	wd_report(wd);
+	rc = do_work(file, workers, flags);
 
-	wd_close(wd);
-
-	return EXIT_SUCCESS;
+	return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
