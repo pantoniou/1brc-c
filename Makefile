@@ -9,7 +9,7 @@ CFLAGS=-O2 -Wall -g -fno-sanitize=address
 
 all: 1brc-c
 
-1brc-c: 1brc-c.c
+1brc-c: 1brc-c.c Makefile
 	$(CC) $(CFLAGS) -o $@ $< -lm -lpthread
 
 clean:

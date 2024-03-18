@@ -55,23 +55,24 @@ ALWAYS_INLINE uint32_t load32(const void *p)
 	return *(const uint32_t *)p;
 }
 
-#ifdef CHECKS
-ALWAYS_INLINE uint64_t load64_guard(const void *p, const void *e, uint64_t guard)
+ALWAYS_INLINE uint64_t load64_guard(const void *p, const void *e, const uint64_t guard)
 {
+	uint64_t tmp;
+
 	/* in the buffer */
-	if (!guard || (p + sizeof(uint64_t)) <= e)
+	if ((p + sizeof(uint64_t)) <= e)
 		return load64(p);
 	if (p >= e)
 		return guard;
-	memcpy(&guard, p, (size_t)(e - p));
-	return guard;
+	tmp = guard;
+	memcpy(&tmp, p, (size_t)(e - p));
+	return tmp;
 }
-#else
-static inline uint64_t load64_guard(const void *p, const void *e, uint64_t guard)
+
+ALWAYS_INLINE uint64_t load64_check(const void *p, const void *e, const uint64_t guard, const bool check)
 {
-	return load64(p);
+	return check ? load64_guard(p, e, guard) : load64(p);
 }
-#endif
 
 #define SEMICOLON	0x3b  /*  ; */
 #define NEWLINE		0x0a  /* \n */
@@ -458,7 +459,7 @@ wb_parse_line(struct work_block *wb,
 		// fprintf(stderr, "load: %s\n", VSTR(load64_guard(s, e, SEMICOLONS)));
 
 		/* load a 64 bit value (guarding if needed) */
-		cv = check ? load64_guard(s, e, SEMICOLONS) : load64(s);
+		cv = load64_check(s, e, SEMICOLONS, check);
 		/* make a 0 byte appear where a semicolon exists */
 		mv = zbyte_mangle(cv ^ SEMICOLONS);
 		if (mv)
@@ -498,7 +499,7 @@ wb_parse_line(struct work_block *wb,
 
 		/* shift in any partial */
 		if (have < MAX_TEMP_BYTES) {
-			tv = check ? load64_guard(s + have, e, NEWLINES) : load64(s + have);
+			tv = load64_check(s + have, e, NEWLINES, check);
 			cv |= tv << (have << 3);
 		}
 	} else {
@@ -602,7 +603,7 @@ parse_line(const char *start, size_t len, const bool check)
 {
 	struct parse_line_info r;
 	const char *s, *e;
-	uint64_t cv, tv, mv, m;
+	uint64_t cv, tv, mv;
 	int bpos, adv, have, minus_mult;
 
 	//
@@ -621,15 +622,8 @@ parse_line(const char *start, size_t len, const bool check)
 	e = start + len;
 
 	r.h = hash_setup();
-	for (;;) {
-		// fprintf(stderr, "load: %s\n", VSTR(load64_guard(s, e, SEMICOLONS)));
 
-		/* load a 64 bit value (guarding if needed) */
-		cv = check ? load64_guard(s, e, SEMICOLONS) : load64(s);
-		/* make a 0 byte appear where a semicolon exists */
-		mv = zbyte_mangle(cv ^ SEMICOLONS);
-		if (mv)
-			break; /* break out when a semicolon is found */
+	while ((mv = zbyte_mangle((cv = load64_check(s, e, SEMICOLONS, check)) ^ SEMICOLONS)) == 0) {
 		r.h = hash_update(r.h, cv);
 		s += sizeof(uint64_t);
 	}
@@ -638,16 +632,19 @@ parse_line(const char *start, size_t len, const bool check)
 	bpos = zbyte_bpos(mv);
 	/* convert it to a byte advance number */
 	adv = zbyte_bpos_to_adv(bpos);
+	s += adv;
 
 	// fprintf(stderr, "found bpos=%d, adv=%d\n", bpos, adv);
 
 	/* if it's 0, it means that we don't have to advance */
-	if (adv) {
-		m = zbyte_mask_from_bpos(bpos);
-		/* mask out the non city part */
-		r.h = hash_update(r.h, cv & m);
-		s += adv;
-	}
+	if (adv)
+		r.h = hash_update(r.h, cv & zbyte_mask_from_bpos(bpos));
+
+	/* must be done in two steps, because if adv == 8 shift about is
+	 * size of the type. on most arches the shift is modulo.
+	 */
+	cv >>= 8;
+	cv >>= (adv << 3);
 
 	r.clen = (size_t)(s - start);
 
@@ -658,17 +655,9 @@ parse_line(const char *start, size_t len, const bool check)
 
 	// fprintf(stderr, "have=%d, cv=%s\n", have, VSTR(cv));
 
-	/* must be done in two steps, because if adv == 8
-	 * we need to shift out the entire content
-	 */
-	cv >>= 8;
-	cv >>= (adv << 3);
-
 	/* shift in any partial */
-	if (have < MAX_TEMP_BYTES) {
-		tv = check ? load64_guard(s + have, e, NEWLINES) : load64(s + have);
-		cv |= tv << (have << 3);
-	}
+	if (have < MAX_TEMP_BYTES)
+		cv |= load64_check(s + have, e, NEWLINES, check) << (have << 3);
 
 	/*
 	 * Sign multiplier:
@@ -717,17 +706,11 @@ parse_line(const char *start, size_t len, const bool check)
 	tv = ~cv & (1 << 12);
 	cv <<= (tv >> 9);
 
-	/* advance pointer by the amount required */
-	// adv = ((unsigned int)minus_mult >> (sizeof(minus_mult) * 8 - 1));
-	// fprintf(stderr, "minus adv=%d\n", adv);
-
        	adv += 3;
-	// fprintf(stderr, "base adv=%d\n", adv);
 
 	/* if 4 byte form the lowest byte is some kind of 3x (bit 4 set) */
        	adv += (cv >> 4) & 1;
 	adv += 1;
-	// fprintf(stderr, "final adv=%d\n", adv);
 
 	/* the low 32bits of the cv contains the temp */
 
@@ -741,6 +724,123 @@ parse_line(const char *start, size_t len, const bool check)
 	r.advance = (uint8_t)(s - start);
 
 	return r;
+}
+
+ALWAYS_INLINE struct parse_line_info
+parse_line2(const char *start, const char *end, const bool check)
+{
+	struct parse_line_info r;
+	uint64_t cv, tv, mv;
+	int pos, bpos, adv, have, minus_mult;
+
+	//
+	// Input: 'Foobar;4'
+	// Need to advance 6
+	//                         LE                     BE
+	//          4  ;  r a b o o F      F o o b a r  ;  4
+	//    cv 0x34_3b_7261626f6f46   0x466f6f626172_3b_34
+	//    mv 0x00_80_000000000000   0x000000000000_80_00
+	//     m 0x00_00_ffffffffffff   0xffffffffffff_00_00
+	//  bpos                   55                     48
+	//   adv                    7                      7
+	//
+	//
+
+	pos = 0;
+	r.h = hash_setup();
+	while ((mv = zbyte_mangle((cv = load64_check(start + pos, end, SEMICOLONS, check)) ^ SEMICOLONS)) == 0) {
+		r.h = hash_update(r.h, cv);
+		pos += sizeof(uint64_t);
+	}
+
+	/* find the bit position of the semicoon */
+	bpos = zbyte_bpos(mv);
+	/* convert it to a byte advance number */
+	adv = zbyte_bpos_to_adv(bpos);
+	pos += adv;
+
+	/* if it's 0, it means that we don't have to advance */
+	if (adv)
+		r.h = hash_update(r.h, cv & zbyte_mask_from_bpos(bpos));
+
+	/* must be done in two steps, because if adv == 8 shift about is
+	 * size of the type. on most arches the shift is modulo.
+	 */
+	cv >>= 8;
+	cv >>= (adv << 3);
+
+	r.clen = pos++;
+
+	/* how many bytes we have that are valid */
+	have = 8 - (adv + 1);
+
+	/* shift in any partial */
+	if (have < MAX_TEMP_BYTES)
+		cv |= load64_check(start + pos + have, end, NEWLINES, check) << (have << 3);
+
+	/*
+	 * Sign multiplier:
+	 * Get either ..00000001 (1) or ..11111111 (-1)
+	 * the minus sign is ascii 0x2d while all digits are 0x30-0x39
+	 * so for '-' bit 4 is 0, while for digits it is 1
+	 *
+	 *                 minus digit(3x)
+	 *              -------- ---------
+	 * original     00101101  0011xxxx
+	 * mask-out     00000000  00010000
+	 * shift-right  00000000  00000001
+	 * subtract 1   11111111  00000000
+	 * or 1         11111111  00000001
+	 * result             -1         1
+	 */
+
+	/* get the 4th bit to the 0 position */
+	tv = (cv & 0x10) >> 4;
+
+	pos += (int)(tv ^ 1);
+
+	/* shift out the minus */
+	cv >>= ((~cv & 0x10) >> 1);
+
+	tv -= 1;
+	tv |= 1;
+	minus_mult = (int)tv;
+
+	/*
+	 * Convert 4 byte form to 3 byte form
+	 * If it is 3 byte form the second byte
+	 * is '.' with value 0x2e. Similarly with '-'
+	 * the 4'th bit of that value is 0.
+	 *
+	 *             4 bytes  3 bytes
+	 *             -------  --------
+	 * original    3x3x2E3x 3x2E3xyy
+	 * tv          00000000 00100000
+	 * shift-left         0        8
+	 * result      3x3x2e3x 003x2e3x
+	 *
+	 * Note that the high byte for 3 bytes is now 00 not 30
+	 */
+
+	tv = ~cv & (1 << 12);
+	cv <<= (tv >> 9);
+
+       	pos += 3 + ((cv >> 4) & 1) + 1;
+
+	/* calculate */
+	r.temp = (((uint32_t)cv & 0x0f000f0f) *
+		 (uint64_t)(1 + (10 << 16) + (100 << 24)) >> 24) & ((1 << 10) - 1);
+	r.temp *= minus_mult;
+
+	r.advance = pos;
+
+	return r;
+}
+
+__attribute__((noinline)) struct parse_line_info
+parse_line_no_inline(const char *start, const char *end)
+{
+	return parse_line2(start, end, false);
 }
 
 int wb_process_actual(struct work_block *wb)
@@ -790,16 +890,16 @@ int wb_process_actual2(struct work_block *wb)
 	madvise((void *)s, (size_t)(e - s), MADV_SEQUENTIAL | MADV_WILLNEED);
 
 	/* while we're safe, conditions out bound limits */
-	len = (size_t)(e - s);
-	while (len >= MAX_LINE_SIZE) {
-		r = parse_line(s, len, false);
+	while ((size_t)(e - s) >= MAX_LINE_SIZE) {
+		r = parse_line2(s, e, false);
 		use_result(wb, r, s);
 		s += r.advance;
 		len -= r.advance;
 	}
 
-	while (len > 0) {
-		r = parse_line(s, len, false);
+	/* we need to check bounds now */
+	while (s < e) {
+		r = parse_line2(s, e, true);
 		use_result(wb, r, s);
 		s += r.advance;
 		len -= r.advance;
