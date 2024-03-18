@@ -24,6 +24,16 @@
 #include <getopt.h>
 #include <alloca.h>
 #include <pthread.h>
+#include <stdatomic.h>
+
+static inline long long
+delta_ns(struct timespec before, struct timespec after)
+{
+        if ((before.tv_sec == 0 && before.tv_nsec == 0) ||
+            (after.tv_sec == 0 && after.tv_nsec == 0))
+                return -1;
+        return (long long)((int64_t)(after.tv_sec - before.tv_sec) * (int64_t)1000000000UL + (int64_t)(after.tv_nsec - before.tv_nsec));
+}
 
 #define MAX_STATION_BYTES	100
 #define MAX_STATION_COUNT	10000
@@ -218,6 +228,7 @@ struct work_block {
 
 struct weather_data {
 	const char *file;
+	unsigned int flags;
 	int fd;
 	void *addr;
 	const char *start;
@@ -225,7 +236,11 @@ struct weather_data {
 	struct work_block *root_wb;
 };
 
-struct weather_data *wd_open(const char *file, int workers);
+#define WDF_VERBOSE	1
+#define WDF_TIMINGS	2
+#define WDF_BENCH	4
+
+struct weather_data *wd_open(const char *file, int workers, unsigned int flags);
 void wd_close(struct weather_data *wd);
 
 struct city_data *cd_create(const char *name, size_t len, uint64_t h)
@@ -883,6 +898,9 @@ int wb_process_actual2(struct work_block *wb)
 	const char *s, *e;
 	size_t len;
 	struct parse_line_info r;
+	struct timespec tstart, tend;
+
+	clock_gettime(CLOCK_MONOTONIC, &tstart);
 
 	s = wb->wd->start + wb->offset;
 	e = s + wb->size;
@@ -904,6 +922,11 @@ int wb_process_actual2(struct work_block *wb)
 		s += r.advance;
 		len -= r.advance;
 	}
+
+	clock_gettime(CLOCK_MONOTONIC, &tend);
+
+	if (wb->wd->flags & WDF_TIMINGS)
+		fprintf(stderr, "%s: time=%lldns\n", __func__, delta_ns(tstart, tend));
 
 	return 0;
 }
@@ -934,6 +957,7 @@ int wb_process(struct work_block *wb)
 	const char *s, *e, *p;
 	int rc;
 	struct city_data *cd, *cdc;
+	struct timespec tstart, tend;
 
 	ret = sysconf(_SC_PAGESIZE);
 	if (ret < 0)
@@ -953,7 +977,6 @@ int wb_process(struct work_block *wb)
 
 	/* if there are no children, or too small we have to do the work */
 	if (nchildren <= 1 || wb->size < pagesz)
-		// return wb_process_actual(wb);
 		return wb_process_actual2(wb);
 
 	s = wb->wd->start + wb->offset;
@@ -976,6 +999,8 @@ int wb_process(struct work_block *wb)
 	for (i = 0, offset = split; i < nsplits; i++, offset += split)
 		splits[i] = offset;
 
+	clock_gettime(CLOCK_MONOTONIC, &tstart);
+
 	/* forward splits to newlines */
 	for (i = 1; i < nchildren; i++) {
 		start = i == 0 ? 0 : splits[i-1];
@@ -989,6 +1014,11 @@ int wb_process(struct work_block *wb)
 		}
 		splits[i-1] = ++p - s;
 	}
+
+	clock_gettime(CLOCK_MONOTONIC, &tend);
+
+	if (wb->wd->flags & WDF_TIMINGS)
+		fprintf(stderr, "%s: split time=%lldns\n", __func__, delta_ns(tstart, tend));
 
 	/* create the workers */
 	for (i = 0; i < nchildren; i++) {
@@ -1013,6 +1043,8 @@ int wb_process(struct work_block *wb)
 		assert(!rc);
 	}
 
+	clock_gettime(CLOCK_MONOTONIC, &tstart);
+
 	/* merge the results */
 	for (i = 0; i < nchildren; i++) {
 		wbc = wbs[i];
@@ -1032,9 +1064,21 @@ int wb_process(struct work_block *wb)
 		}
 	}
 
+	clock_gettime(CLOCK_MONOTONIC, &tend);
+
+	if (wb->wd->flags & WDF_TIMINGS)
+		fprintf(stderr, "%s: merge time=%lldns\n", __func__, delta_ns(tstart, tend));
+
+	clock_gettime(CLOCK_MONOTONIC, &tstart);
+
 	/* destroy the workers */
 	for (i = 0; i < nchildren; i++)
 		wb_destroy(wbs[i]);
+
+	clock_gettime(CLOCK_MONOTONIC, &tend);
+
+	if (wb->wd->flags & WDF_TIMINGS)
+		fprintf(stderr, "%s: children destroy time=%lldns\n", __func__, delta_ns(tstart, tend));
 
 	return 0;
 }
@@ -1056,9 +1100,12 @@ void wb_report(struct work_block *wb)
 	struct city_data *cd;
 	unsigned int i, count;
 	struct city_data **cdtab;
+	struct timespec tstart, tend;
 
 	if (!wb)
 		return;
+
+	clock_gettime(CLOCK_MONOTONIC, &tstart);
 
 	cdtab = malloc(sizeof(*cdtab) * wb->city_count);
 	ASSERT(cdtab);
@@ -1089,10 +1136,15 @@ void wb_report(struct work_block *wb)
 	}
 
 	free(cdtab);
+
+	clock_gettime(CLOCK_MONOTONIC, &tend);
+
+	if (wb->wd->flags & WDF_TIMINGS)
+		fprintf(stderr, "%s: time=%lldns\n", __func__, delta_ns(tstart, tend));
 }
 
 struct weather_data *
-wd_open(const char *file, int workers)
+wd_open(const char *file, int workers, unsigned int flags)
 {
 	struct weather_data *wd;
 	struct stat sb;
@@ -1104,6 +1156,7 @@ wd_open(const char *file, int workers)
 	memset(wd, 0, sizeof(*wd));
 	wd->fd = -1;
 	wd->file = file;
+	wd->flags = flags;
 
 	wd->fd = open(wd->file, O_RDONLY);
 	if (wd->fd < 0)
@@ -1115,7 +1168,7 @@ wd_open(const char *file, int workers)
 
 	wd->size = sb.st_size;
 
-	wd->addr = mmap(NULL, wd->size, PROT_READ, MAP_SHARED, wd->fd, 0);
+	wd->addr = mmap(NULL, wd->size, PROT_READ, MAP_PRIVATE, wd->fd, 0);
 	if (wd->addr == MAP_FAILED)
 		goto err_out;
 
@@ -1143,8 +1196,13 @@ err_out:
 
 void wd_close(struct weather_data *wd)
 {
+	struct timespec tstart, tend;
+	unsigned int flags;
+
 	if (!wd)
 		return;
+
+	clock_gettime(CLOCK_MONOTONIC, &tstart);
 
 	if (wd->root_wb)
 		wb_destroy(wd->root_wb);
@@ -1155,7 +1213,13 @@ void wd_close(struct weather_data *wd)
 	if (wd->fd >= 0)
 		close(wd->fd);
 
+	flags = wd->flags;
 	free(wd);
+
+	clock_gettime(CLOCK_MONOTONIC, &tend);
+
+	if (flags & WDF_TIMINGS)
+		fprintf(stderr, "%s: time=%lldns\n", __func__, delta_ns(tstart, tend));
 }
 
 void wd_report(struct weather_data *wd)
@@ -1167,6 +1231,8 @@ void wd_report(struct weather_data *wd)
 
 static struct option lopts[] = {
 	{"bench",		no_argument,		0,	'b' },
+	{"verbose",		no_argument,		0,	'v' },
+	{"timings",		no_argument,		0,	't' },
 	{"workers",		required_argument,	0,	'w' },
 	{"help",		no_argument,		0,	'h' },
 	{0,			0,              	0,	 0  },
@@ -1178,7 +1244,9 @@ static void display_usage(FILE *fp)
 	fprintf(fp, "\nArguments:\n\n");
 	fprintf(fp, "\t[file]                   : File to process (default measurements.txt)\n");
 	fprintf(fp, "\nOptions:\n\n");
-	fprintf(fp, "\n--bench, -b              : Bench mode no output\n");
+	fprintf(fp, "\t--bench, -b              : Bench mode (no report output)\n");
+	fprintf(fp, "\t--verbose, -v            : Verbose mode\n");
+	fprintf(fp, "\t--timings, -t            : Timing info at stderr\n");
 	fprintf(fp, "\t--workers, -w <n>        : Set workers to <n>\n");
 	fprintf(fp, "\t--help, -h               : Display  help message\n");
 	fprintf(fp, "\n");
@@ -1190,16 +1258,21 @@ int main(int argc, char *argv[])
 	struct weather_data *wd = NULL;
 	const char *file;
 	int workers = -1;
-	bool bench = false;
-	int ret = EXIT_FAILURE;
+	unsigned int flags = 0;
 
-	while ((opt = getopt_long_only(argc, argv, "w:bh", lopts, &lidx)) != -1) {
+	while ((opt = getopt_long_only(argc, argv, "w:bvth", lopts, &lidx)) != -1) {
 		switch (opt) {
 		case 'w':
 			workers = atoi(optarg);
 			break;
 		case 'b':
-			bench = true;
+			flags |= WDF_BENCH;
+			break;
+		case 'v':
+			flags |= WDF_VERBOSE;
+			break;
+		case 't':
+			flags |= WDF_TIMINGS;
 			break;
 		case 'h':
 		default:
@@ -1212,18 +1285,15 @@ int main(int argc, char *argv[])
 
 	file = optind >= argc ? "measurements.txt" : argv[optind];
 
-	wd = wd_open(file, workers);
-	if (wd) {
-		if (!bench)
-			wd_report(wd);
-
-		wd_close(wd);
-
-		ret = EXIT_SUCCESS;
-	} else
+	wd = wd_open(file, workers, flags);
+	if (!wd) {
 		fprintf(stderr, "Unable to open/process weather data file '%s': %s\n",
 				file, strerror(errno));
+		return EXIT_FAILURE;
+	}
+	wd_report(wd);
 
-	return ret;
+	wd_close(wd);
 
+	return EXIT_SUCCESS;
 }
