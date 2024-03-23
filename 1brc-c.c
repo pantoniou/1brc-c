@@ -80,33 +80,14 @@ ALWAYS_INLINE uint64_t load64_check(const void *p, const void *e, const uint64_t
 #define NEWLINES	0x0a0a0a0a0a0a0a0aLU
 #define CARRYMASKS	0x7F7F7F7F7F7F7F7FLU
 
-ALWAYS_INLINE uint64_t zbyte_mangle(uint64_t x)
-{
-	uint64_t y;
-								// Original byte: 00 80 other
-	y = (x & 0x7F7F7F7F7F7F7F7FLU) + 0x7F7F7F7F7F7F7F7FLU;	// 7F 7F 1xxxxxxx
-	y = ~(y | x | 0x7F7F7F7F7F7F7F7FLU);			// 80 00 00000000
-	return y;
-}
+#define TEMP_IN_MASK	0x0f000f0f
+#define TEMP_MULT	(1 + (10 << 16) + (100 << 24))
+#define TEMP_SHIFT	24
+#define TEMP_OUT_MASK	((1 << 10) - 1)
 
-ALWAYS_INLINE int zbyte_bpos(uint64_t mv)
+ALWAYS_INLINE int count_trailing_zeroes(uint64_t mv)
 {
-	return __builtin_ctzl((long)mv);
-}
-
-ALWAYS_INLINE int zbyte_bpos_to_adv(int bpos)
-{
-	return bpos >> 3;
-}
-
-ALWAYS_INLINE uint64_t zbyte_mask_from_bpos(int bpos)
-{
-	return (((uint64_t)-1) >> (64 - (bpos - 7)));
-}
-
-ALWAYS_INLINE uint64_t set_char_at_pos(uint64_t v, char c, int pos)
-{
-	return v | (((uint64_t)(uint8_t)c) << (pos << 3));
+	return mv ? __builtin_ctzl((long)mv) : sizeof(uint64_t) * 8;
 }
 
 #ifdef HASH_MURMUR
@@ -315,20 +296,35 @@ parse_line(const char *start, const char *end, const bool check)
 
 	pos = 0;
 	r.h = hash_setup();
-	while ((mv = zbyte_mangle((cv = load64_check(start + pos, end, SEMICOLONS, check)) ^ SEMICOLONS)) == 0) {
-		r.h = hash_update(r.h, cv);
-		pos += sizeof(uint64_t);
-	}
 
-	/* find the bit position of the semicoon */
-	bpos = zbyte_bpos(mv);
-	/* convert it to a byte advance number */
-	adv = zbyte_bpos_to_adv(bpos);
-	pos += adv;
+	do {
+		/* load 8 bytes (possibly checking for bounds) */
+		cv = load64_check(start + pos, end, SEMICOLONS, check);
 
-	/* if it's 0, it means that we don't have to advance */
-	if (adv)
-		r.h = hash_update(r.h, cv & zbyte_mask_from_bpos(bpos));
+		/* zero out all semicolon bytes */
+		mv = cv ^ SEMICOLONS;
+
+		/* find out if any byte is zero */
+		tv = (mv & CARRYMASKS) + CARRYMASKS;
+
+		/* every byte that was zero is now 0x80 */
+		mv = ~(tv | mv | CARRYMASKS);
+
+		/* number of trailing zeroes */
+		bpos = count_trailing_zeroes(mv);
+
+		/* convert it to a byte advance number */
+		adv = bpos >> 3;
+
+		/* generate a mask for the hash update
+		 * note that the mask includes the semicolon
+		 */
+		tv = cv & ((uint64_t)-1) >> (64 - bpos);
+
+		r.h = hash_update(r.h, tv);
+		pos += adv;
+
+	} while (!mv);
 
 	/* must be done in two steps, because if adv == 8 shift about is
 	 * size of the type. on most arches the shift is modulo.
@@ -395,8 +391,7 @@ parse_line(const char *start, const char *end, const bool check)
        	pos += 3 + ((cv >> 4) & 1) + 1;
 
 	/* calculate */
-	r.temp = (((uint32_t)cv & 0x0f000f0f) *
-		 (uint64_t)(1 + (10 << 16) + (100 << 24)) >> 24) & ((1 << 10) - 1);
+	r.temp = (((cv & TEMP_IN_MASK) * TEMP_MULT) >> TEMP_SHIFT) & TEMP_OUT_MASK;
 	r.temp *= minus_mult;
 
 	r.advance = pos;
@@ -421,7 +416,7 @@ parse_line_reference(const char *start, const char *end)
 	while (s < end && (c = *s++) != ';') {
 		if (wpos == 0)
 			v = 0;
-		v = set_char_at_pos(v, c, wpos);
+		v |= (((uint64_t)(uint8_t)c) << (wpos << 3));
 		if (++wpos >= 8) {
 			r.h = hash_update(r.h, v);
 			wpos = 0;

@@ -2,11 +2,11 @@
 
 CC=gcc
 # CC=clang
-CFLAGS=-O3 -Wall -march=native -mtune=native -flto
+# CFLAGS=-O3 -Wall -march=native -mtune=native -flto
 # CFLAGS=-O2 -Wall -g -fno-omit-frame-pointer
 CFLAGS=-O3 -Wall -fno-sanitize=address
 
-all: run
+all: 1brc-c
 
 1brc-c: 1brc-c.c Makefile
 	$(CC) $(CFLAGS) -o $@ $< -lm -lpthread
