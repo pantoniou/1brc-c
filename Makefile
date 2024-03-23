@@ -4,7 +4,10 @@ CC=gcc
 # CC=clang
 # CFLAGS=-O3 -Wall -march=native -mtune=native -flto
 # CFLAGS=-O2 -Wall -g -fno-omit-frame-pointer
+# CFLAGS=-O3 -Wall -fno-sanitize=address -mtune=native -march=native
+# CFLAGS=-O3 -Wall -fno-sanitize=address
 CFLAGS=-O3 -Wall -fno-sanitize=address
+CFLAGS=-O3 -Wall -fno-sanitize=address -mcrc32
 
 all: 1brc-c
 

@@ -47,7 +47,13 @@ delta_ns(struct timespec before, struct timespec after)
 
 #define ALWAYS_INLINE		static inline __attribute__((always_inline))
 
+#ifndef __CRC32__
 #define HASH_MURMUR
+#undef HASH_CRC32
+#else
+#undef HASH_MURMUR
+#define HASH_CRC32
+#endif
 
 ALWAYS_INLINE uint64_t load64(const void *p)
 {
@@ -117,6 +123,22 @@ ALWAYS_INLINE uint64_t hash_update(uint64_t h, uint64_t k)
 
 #endif	/* HASH_MURMUR */
 
+#ifdef HASH_CRC32
+
+#define CRCPOLY 0x11EDC6F41
+
+ALWAYS_INLINE uint64_t hash_setup(void)
+{
+	return CRCPOLY;
+}
+
+ALWAYS_INLINE uint64_t hash_update(uint64_t h, uint64_t k)
+{
+	return (uint64_t)__builtin_ia32_crc32di((unsigned long long)h, (unsigned long long)k);
+}
+
+#endif
+
 struct city_data {
 	struct city_data *next;
 	uint64_t h;
@@ -138,6 +160,7 @@ struct work_block {
 	unsigned int city_count;
 	unsigned int collisions;
 	struct city_data *cdtab[CITIES_HASH_SIZE];
+	uint8_t cdcol[(CITIES_HASH_SIZE + 7) / 8];	/* set bit when there's a collision */
 	struct city_data *create_head;
 	struct work_block *parent;
 	unsigned int children_count;
@@ -240,6 +263,28 @@ void wb_destroy(struct work_block *wb)
 	free(wb);
 }
 
+ALWAYS_INLINE bool
+cd_match(const struct city_data *cd, const char *name, size_t len, uint64_t h)
+{
+	return cd->h == h;
+}
+
+ALWAYS_INLINE struct city_data *
+wb_lookup_city(struct work_block *wb, const char *name, size_t len, uint64_t h)
+{
+	struct city_data *cd;
+	unsigned int idx;
+
+	idx = (unsigned int)(h % (sizeof(wb->cdtab)/sizeof(wb->cdtab[0])));
+	for (cd = wb->cdtab[idx]; cd; cd = cd->next) {
+		if (!cd_match(cd, name, len, h))
+			continue;
+		return cd;
+	}
+
+	return NULL;
+}
+
 ALWAYS_INLINE struct city_data *
 wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, uint64_t h)
 {
@@ -247,12 +292,31 @@ wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, ui
 	unsigned int idx;
 
 	idx = (unsigned int)(h % (sizeof(wb->cdtab)/sizeof(wb->cdtab[0])));
-	for (cd = wb->cdtab[idx]; cd; cd = cd->next) {
-		if (cd->h != h)
-		       continue;
-		return cd;
-	}
+
 	cdheadp = &wb->cdtab[idx];
+	cd = *cdheadp;
+#if 0
+	if (!(wb->cdcol[idx >> 3] & (1 << (idx & 7)))) {
+		/* no hash colission detected */
+		for (; cd; cd = cd->next) {
+			if (cd->h == h)
+				return cd;
+		}
+	} else {
+		abort();
+		/* hash colission detected? very unlikely but... probably bad hash algo */
+		for (; cd; cd = cd->next) {
+			if (cd->h == h && cd->len == len && !memcmp(cd->name, name, len))
+				return cd;
+		}
+	}
+#else
+	/* no hash colission detected */
+	for (cd = wb->cdtab[idx]; cd; cd = cd->next) {
+		if (cd->h == h)
+			return cd;
+	}
+#endif
 
 	cd = cd_create(name, len, h);
 	if (!cd)
@@ -897,7 +961,7 @@ int do_work(const char *file, int workers, unsigned int flags)
 	int r;
 
 	/* fork and do the work on the child
-	 * parent can exit prematurely without reaping 
+	 * parent can exit prematurely without reaping
 	 * the child, so does not incur the cost of
 	 * unmapping the file
 	 */
