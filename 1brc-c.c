@@ -343,7 +343,7 @@ parse_line(const char *start, const char *end, const bool check)
 {
 	struct parse_line_info r;
 	uint64_t cv, tv, mv;
-	int pos, bpos, adv, have, minus_mult;
+	int pos, bpos, adv, have, minus_mult, tlen;
 	uint32_t h;
 	int16_t temp;
 	uint8_t clen;
@@ -365,11 +365,15 @@ parse_line(const char *start, const char *end, const bool check)
 	h = hash_setup();
 
 	do {
-		/* load 8 bytes (possibly checking for bounds) */
-		cv = load64_check(start + pos, end, SEMICOLONS, check);
+		assert(start + pos < end);
+
+		/* load 8 bytes */
+		cv = load64(start + pos);
 
 		/* zero out all semicolon bytes */
 		mv = cv ^ SEMICOLONS;
+
+		fprintf(stderr, "pos=%d cv=0x%016lx mv=0x%016lx\n", pos, __builtin_bswap64(cv), __builtin_bswap64(mv));
 
 		/* find out if any byte is zero */
 		tv = (mv & CARRYMASKS) + CARRYMASKS;
@@ -399,14 +403,14 @@ parse_line(const char *start, const char *end, const bool check)
 	cv >>= 8;
 	cv >>= (adv << 3);
 
-	clen = (uint8_t)pos++;
+	clen = (uint8_t)pos;
 
 	/* how many bytes we have that are valid */
 	have = 8 - (adv + 1);
 
 	/* shift in any partial */
 	if (have < MAX_TEMP_BYTES)
-		cv |= load64_check(start + pos + have, end, NEWLINES, check) << (have << 3);
+		cv |= load64(start + pos + have);
 
 	/*
 	 * Sign multiplier:
@@ -424,10 +428,12 @@ parse_line(const char *start, const char *end, const bool check)
 	 * result             -1         1
 	 */
 
+	fprintf(stderr, "temp cv=0x%016lx\n", __builtin_bswap64(cv));
+
 	/* get the 4th bit to the 0 position */
 	tv = (cv & 0x10) >> 4;
 
-	pos += (int)(tv ^ 1);
+	tlen = (int)(tv ^ 1);
 
 	/* shift out the minus */
 	cv >>= ((~cv & 0x10) >> 1);
@@ -455,15 +461,20 @@ parse_line(const char *start, const char *end, const bool check)
 	tv = ~cv & (1 << 12);
 	cv <<= (tv >> 9);
 
-       	pos += 3 + ((cv >> 4) & 1) + 1;
-
 	/* calculate */
 	temp = ((((cv & TEMP_IN_MASK) * TEMP_MULT) >> TEMP_SHIFT) & TEMP_OUT_MASK) * minus_mult;
 
+	tlen += 3 + ((cv >> 4) & 1);
+
+	fprintf(stderr, "after cv=0x%016lx clen=%d tlen=%d - city=%.*s temp=%.*s (%d)\n",
+			__builtin_bswap64(cv), clen, tlen,
+			clen, start,
+			tlen, start + clen + 1,
+			temp);
 	r.h = h;
 	r.temp = temp;
 	r.clen = clen;
-	r.advance = pos;
+	r.advance = clen + 1 + tlen + 1;
 
 	return r;
 }
@@ -570,8 +581,17 @@ int wb_process_actual(struct work_block *wb)
 	}
 #else
 	while (s < e) {
+#if 0
+		{
+			int pos = s - (wb->wd->start + wb->offset);
+
+			fprintf(stderr, "pos=%d left=%ld\n", pos, e - s);
+		}
+#endif
+
 		r = parse_line(s, e, false);
 		process_result(wb, r, s);
+		assert(r.advance > 0);
 		s += r.advance;
 	}
 #endif
