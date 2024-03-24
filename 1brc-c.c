@@ -127,21 +127,25 @@ ALWAYS_INLINE uint64_t hash_update(uint64_t h, uint64_t k)
 
 #define CRCPOLY 0x11EDC6F41
 
-ALWAYS_INLINE uint64_t hash_setup(void)
+ALWAYS_INLINE uint32_t hash_setup(void)
 {
-	return CRCPOLY;
+	return (uint32_t)CRCPOLY;
 }
 
-ALWAYS_INLINE uint64_t hash_update(uint64_t h, uint64_t k)
+ALWAYS_INLINE uint32_t hash_update(uint32_t h, uint64_t k)
 {
-	return (uint64_t)__builtin_ia32_crc32di((unsigned long long)h, (unsigned long long)k);
+	return (uint32_t)__builtin_ia32_crc32di((unsigned long long)h, (unsigned long long)k);
 }
 
 #endif
 
 struct city_data {
 	struct city_data *next;
+#if 0
 	uint64_t h;
+#else
+	uint32_t h;
+#endif
 	uint64_t count;
 	int64_t sumt;
 	int16_t mint, maxt;
@@ -160,7 +164,7 @@ struct work_block {
 	unsigned int city_count;
 	unsigned int collisions;
 	struct city_data *cdtab[CITIES_HASH_SIZE];
-	uint8_t cdcol[(CITIES_HASH_SIZE + 7) / 8];	/* set bit when there's a collision */
+	uint8_t cdcol[CITIES_HASH_SIZE];
 	struct city_data *create_head;
 	struct work_block *parent;
 	unsigned int children_count;
@@ -173,8 +177,10 @@ struct weather_data {
 	int fd;
 	void *addr;
 	const char *start;
+	void *guard_page;
 	size_t size;
 	struct work_block *root_wb;
+	size_t pagesz;
 };
 
 #define WDF_VERBOSE	1
@@ -187,7 +193,7 @@ struct weather_data {
 struct weather_data *wd_open(const char *file, int workers, unsigned int flags);
 void wd_close(struct weather_data *wd);
 
-struct city_data *cd_create(const char *name, size_t len, uint64_t h)
+struct city_data *cd_create(const char *name, size_t len, uint32_t h)
 {
 	size_t cdsize;
 	struct city_data *cd;
@@ -263,21 +269,15 @@ void wb_destroy(struct work_block *wb)
 	free(wb);
 }
 
-ALWAYS_INLINE bool
-cd_match(const struct city_data *cd, const char *name, size_t len, uint64_t h)
-{
-	return cd->h == h;
-}
-
 ALWAYS_INLINE struct city_data *
-wb_lookup_city(struct work_block *wb, const char *name, size_t len, uint64_t h)
+wb_lookup_city(struct work_block *wb, const char *name, size_t len, uint32_t h)
 {
 	struct city_data *cd;
 	unsigned int idx;
 
 	idx = (unsigned int)(h % (sizeof(wb->cdtab)/sizeof(wb->cdtab[0])));
 	for (cd = wb->cdtab[idx]; cd; cd = cd->next) {
-		if (!cd_match(cd, name, len, h))
+		if (cd->h != h)
 			continue;
 		return cd;
 	}
@@ -286,7 +286,7 @@ wb_lookup_city(struct work_block *wb, const char *name, size_t len, uint64_t h)
 }
 
 ALWAYS_INLINE struct city_data *
-wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, uint64_t h)
+wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, uint32_t h)
 {
 	struct city_data *cd, **cdheadp;
 	unsigned int idx;
@@ -296,7 +296,7 @@ wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, ui
 	cdheadp = &wb->cdtab[idx];
 	cd = *cdheadp;
 #if 0
-	if (!(wb->cdcol[idx >> 3] & (1 << (idx & 7)))) {
+	if (!(wb->cdcol[idx])) {
 		/* no hash colission detected */
 		for (; cd; cd = cd->next) {
 			if (cd->h == h)
@@ -332,7 +332,7 @@ wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, ui
 }
 
 struct parse_line_info {
-	uint64_t h;
+	uint32_t h;
 	int16_t temp;
 	uint8_t clen;
 	uint8_t advance;
@@ -344,6 +344,9 @@ parse_line(const char *start, const char *end, const bool check)
 	struct parse_line_info r;
 	uint64_t cv, tv, mv;
 	int pos, bpos, adv, have, minus_mult;
+	uint32_t h;
+	int16_t temp;
+	uint8_t clen;
 
 	//
 	// Input: 'Foobar;4'
@@ -359,7 +362,7 @@ parse_line(const char *start, const char *end, const bool check)
 	//
 
 	pos = 0;
-	r.h = hash_setup();
+	h = hash_setup();
 
 	do {
 		/* load 8 bytes (possibly checking for bounds) */
@@ -385,7 +388,7 @@ parse_line(const char *start, const char *end, const bool check)
 		 */
 		tv = cv & ((uint64_t)-1) >> (64 - bpos);
 
-		r.h = hash_update(r.h, tv);
+		h = hash_update(h, tv);
 		pos += adv;
 
 	} while (!mv);
@@ -396,7 +399,7 @@ parse_line(const char *start, const char *end, const bool check)
 	cv >>= 8;
 	cv >>= (adv << 3);
 
-	r.clen = pos++;
+	clen = (uint8_t)pos++;
 
 	/* how many bytes we have that are valid */
 	have = 8 - (adv + 1);
@@ -455,9 +458,11 @@ parse_line(const char *start, const char *end, const bool check)
        	pos += 3 + ((cv >> 4) & 1) + 1;
 
 	/* calculate */
-	r.temp = (((cv & TEMP_IN_MASK) * TEMP_MULT) >> TEMP_SHIFT) & TEMP_OUT_MASK;
-	r.temp *= minus_mult;
+	temp = ((((cv & TEMP_IN_MASK) * TEMP_MULT) >> TEMP_SHIFT) & TEMP_OUT_MASK) * minus_mult;
 
+	r.h = h;
+	r.temp = temp;
+	r.clen = clen;
 	r.advance = pos;
 
 	return r;
@@ -509,10 +514,17 @@ parse_line_reference(const char *start, const char *end)
 }
 
 __attribute__((noinline)) struct parse_line_info
-parse_line_no_inline(const char *start, const char *end)
+parse_line_no_inline_no_check(const char *start, const char *end)
 {
 	return parse_line(start, end, false);
 }
+
+__attribute__((noinline)) struct parse_line_info
+parse_line_no_inline_check(const char *start, const char *end)
+{
+	return parse_line(start, end, true);
+}
+
 
 ALWAYS_INLINE void
 process_result(struct work_block *wb, struct parse_line_info r, const char *s)
@@ -542,6 +554,7 @@ int wb_process_actual(struct work_block *wb)
 
 	madvise((void *)s, (size_t)(e - s), MADV_SEQUENTIAL | MADV_WILLNEED);
 
+#if 0
 	/* while we're safe, condition out bound limits */
 	while ((size_t)(e - s) >= MAX_LINE_SIZE) {
 		r = parse_line(s, e, false);
@@ -555,6 +568,13 @@ int wb_process_actual(struct work_block *wb)
 		process_result(wb, r, s);
 		s += r.advance;
 	}
+#else
+	while (s < e) {
+		r = parse_line(s, e, false);
+		process_result(wb, r, s);
+		s += r.advance;
+	}
+#endif
 
 	clock_gettime(CLOCK_MONOTONIC, &tend);
 
@@ -605,7 +625,6 @@ static void *wb_thread_start(void *arg)
 int wb_process(struct work_block *wb)
 {
 	size_t pagesz, split;
-	long ret;
 	pthread_t *tids;
 	struct work_block **wbs, *wbc;
 	off_t *splits;
@@ -618,11 +637,7 @@ int wb_process(struct work_block *wb)
 	struct city_data *cd, *cdc;
 	struct timespec tstart, tend;
 
-	ret = sysconf(_SC_PAGESIZE);
-	if (ret < 0)
-		return -1;
-
-	pagesz = (size_t)ret;
+	pagesz = wb->wd->pagesz;
 
 	/* start with the number of children configured
 	 * and try to use as many children possible
@@ -840,6 +855,8 @@ wd_open(const char *file, int workers, unsigned int flags)
 {
 	struct weather_data *wd;
 	struct stat sb;
+	long sval;
+	size_t size_pgalign;
 	int rc;
 
 	wd = malloc(sizeof(*wd));
@@ -849,6 +866,11 @@ wd_open(const char *file, int workers, unsigned int flags)
 	wd->fd = -1;
 	wd->file = file;
 	wd->flags = flags;
+
+	sval = sysconf(_SC_PAGESIZE);
+	if (sval < 0)
+		perror("sysconf(_SC_PAGESIZE)");
+	wd->pagesz = (size_t)sval;
 
 	wd->fd = open(wd->file, O_RDONLY);
 	if (wd->fd < 0)
@@ -860,11 +882,35 @@ wd_open(const char *file, int workers, unsigned int flags)
 
 	wd->size = sb.st_size;
 
-	wd->addr = mmap(NULL, wd->size, PROT_READ, MAP_PRIVATE, wd->fd, 0);
+	/* get pagesz */
+	size_pgalign = (wd->size + wd->pagesz - 1) & ~(wd->pagesz - 1);
+
+	/* create an anonymous mapping one page larger */
+	wd->guard_page = mmap(NULL, size_pgalign + wd->pagesz,
+				PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+	if (wd->guard_page == MAP_FAILED) {
+		fprintf(stderr, "Unable to map guard page\n");
+		goto err_out;
+	}
+
+	/* now mmap the file right at the top,
+	 * it will replace the anonymous mapping
+	 */
+	wd->addr = mmap(wd->guard_page, wd->size,
+			PROT_READ, MAP_PRIVATE|MAP_FIXED, wd->fd, 0);
 	if (wd->addr == MAP_FAILED)
 		goto err_out;
 
+	/* verify that the mapped address is the one we said */
+	if (wd->addr != wd->guard_page) {
+		fprintf(stderr, "Unable to mmap at fixed address\n");
+		goto err_out;
+	}
+
 	wd->start = wd->addr;
+
+	/* adjust guard page */
+	wd->guard_page += size_pgalign;
 
 	/* we don't need the file anymore */
 	close(wd->fd);
@@ -898,6 +944,9 @@ void wd_close(struct weather_data *wd)
 
 	if (wd->root_wb)
 		wb_destroy(wd->root_wb);
+
+	if (wd->guard_page != MAP_FAILED && wd->guard_page != NULL)
+		munmap(wd->guard_page, wd->pagesz);
 
 	if (wd->addr != MAP_FAILED && wd->addr != NULL)
 		munmap(wd->addr, wd->size);
