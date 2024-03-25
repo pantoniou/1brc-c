@@ -550,10 +550,11 @@ int wb_process_actual(struct work_block *wb)
 		/* get the 4th bit to the 0 position */
 		tv = (cv & 0x10) >> 4;
 
+		/* advance over the sign (if there) */
 		s += (tv ^ 1);
 
 		/* shift out the minus */
-		cv >>= ((~cv & 0x10) >> 1);
+		cv >>= (tv ^ 1) << 3;
 
 		/* convert from 0, 1 to 1, -1 */
 		tv -= 1;
