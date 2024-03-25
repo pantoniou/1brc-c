@@ -27,9 +27,10 @@
 #include <wait.h>
 
 /* sadly, you can't find any big endian machines anymore... */
-#if __BYTE_ORDER != __LITTLE_ENDIAN
-#error Only little endian machines supported.
-#endif
+/* so all processing is done in little endian */
+
+#define likely(x)       __builtin_expect(!!(x), 1)
+#define unlikely(x)     __builtin_expect(!!(x), 0)
 
 static inline long long
 delta_ns(struct timespec before, struct timespec after)
@@ -60,8 +61,14 @@ delta_ns(struct timespec before, struct timespec after)
 
 ALWAYS_INLINE uint64_t load64(const void *p)
 {
-	/* most arches support this */
-	return *(const uint64_t *)p;
+	uint64_t v;
+
+	/* most arches support unaligned accesses */
+	v = *(const uint64_t *)p;
+#if __BYTE_ORDER != __LITTLE_ENDIAN
+	v = __builtin_bswap64(v);
+#endif
+	return v;
 }
 
 ALWAYS_INLINE int count_trailing_zeroes64(uint64_t v)
@@ -138,35 +145,32 @@ ALWAYS_INLINE uint32_t hash_update(uint32_t h, uint64_t k)
 #endif
 
 struct city_data {
-	struct city_data *next;
-#if 0
-	uint64_t h;
-#else
-	uint32_t h;
-#endif
-	uint64_t count;
-	int64_t sumt;
-	int16_t mint, maxt;
-	struct city_data *cnext;	/* created next */
-	char *name;
-	size_t len;
+				    /* offset cacheline */
+	uint64_t count;			/*  0 0 */
+	int64_t sumt;			/*  8 0 */
+	uint32_t h;			/* 16 0 */
+	int16_t mint, maxt;		/* 20 0 */
+	struct city_data *next;		/* 24 0 */
+	struct city_data *cnext;	/* 32 1 */
+	size_t len;			/* 40 1 */
+	char name[];			/* 48 1 */
 };
 
 #define CITIES_HASH_SIZE	4096
 // #define CITIES_HASH_SIZE	16384
 
 struct work_block {
+	struct city_data *cdtab[CITIES_HASH_SIZE];
+	uint8_t cdcol[CITIES_HASH_SIZE];
+	struct weather_data *wd;
 	unsigned int city_count;
 	struct city_data *create_head;
 	bool hash_collision;
-	struct weather_data *wd;
 	off_t offset;
 	size_t size;
 	struct work_block *parent;
 	unsigned int children_count;
 	struct work_block **children;
-	struct city_data *cdtab[CITIES_HASH_SIZE];
-	uint8_t cdcol[CITIES_HASH_SIZE];
 };
 
 struct weather_data {
@@ -179,6 +183,7 @@ struct weather_data {
 	size_t size;
 	struct work_block *root_wb;
 	size_t pagesz;
+	size_t cachelinesz;
 };
 
 #define WDF_VERBOSE	1
@@ -190,26 +195,29 @@ struct weather_data {
 
 struct weather_data *wd_open(const char *file, int workers, unsigned int flags);
 void wd_close(struct weather_data *wd);
+void *wd_malloc(struct weather_data *wd, size_t size);
+void *wb_malloc(struct work_block *wb, size_t size);
 
-struct city_data *cd_create(const char *name, size_t len, uint32_t h)
+struct city_data *cd_create(struct work_block *wb, const char *name, size_t len, uint32_t h)
 {
 	size_t cdsize;
 	struct city_data *cd;
 
 	cdsize = sizeof(*cd) + len + 1;
-	cd = malloc(cdsize);
+	cd = wb_malloc(wb, cdsize);
 	if (!cd)
 		return NULL;
-	memset(cd, 0, sizeof(*cd));
-	cd->name = (char *)(cd + 1);
 
+	cd->count = 0;
+	cd->sumt = 0;
 	cd->h = h;
-	memcpy(cd->name, name, len);
-	cd->name[len] = '\0';
-
-	cd->len = len;
 	cd->mint = INT16_MAX;
 	cd->maxt = INT16_MIN;
+	cd->next = NULL;
+	cd->cnext = NULL;
+	cd->len = len;
+	memcpy(cd->name, name, len);
+	cd->name[len] = '\0';
 
 	return cd;
 }
@@ -219,6 +227,11 @@ void cd_destroy(struct city_data *cd)
 	if (!cd)
 		return;
 	free(cd);
+}
+
+void *wb_malloc(struct work_block *wb, size_t size)
+{
+	return wd_malloc(wb->wd, size);
 }
 
 struct work_block *wb_create(struct weather_data *wd, off_t offset, size_t size, struct work_block *parent, int children)
@@ -236,7 +249,7 @@ struct work_block *wb_create(struct weather_data *wd, off_t offset, size_t size,
 		children = sval;
 	}
 
-	wb = malloc(sizeof(*wb));
+	wb = wd_malloc(wd, sizeof(*wb));
 	if (!wb)
 		return NULL;
 	memset(wb, 0, sizeof(*wb));
@@ -276,7 +289,7 @@ wb_lookup_city(struct work_block *wb, const char *name, size_t len, uint32_t h)
 	idx = (unsigned int)(h % (sizeof(wb->cdtab)/sizeof(wb->cdtab[0])));
 	cd = wb->cdtab[idx];
 
-	if (!wb->hash_collision || !wb->cdcol[idx]) {
+	if (likely(!wb->hash_collision || !wb->cdcol[idx])) {
 		/* no hash collision detected */
 		for (; cd; cd = cd->next) {
 			if (cd->h == h)
@@ -295,16 +308,12 @@ wb_lookup_city(struct work_block *wb, const char *name, size_t len, uint32_t h)
 }
 
 ALWAYS_INLINE struct city_data *
-wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, uint32_t h)
+wb_create_city(struct work_block *wb, const char *name, size_t len, uint32_t h)
 {
 	struct city_data *cd, *cdt;
 	unsigned int idx;
 
-	cd = wb_lookup_city(wb, name, len, h);
-	if (cd)
-		return cd;
-
-	cd = cd_create(name, len, h);
+	cd = cd_create(wb, name, len, h);
 	if (!cd)
 		perror("cd_create");
 
@@ -318,7 +327,7 @@ wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, ui
 	wb->city_count++;
 
 	/* run through the list, and if there is a same hash, turn on collision detection
-	 * this is not just unlikely, if the hash quality is good its chances are
+	 * this is very very unlikely, if the hash quality is good its chances are
 	 * 1/(2^32) one in 4 billion
 	 */
 	for (; cdt; cdt = cdt->next) {
@@ -332,141 +341,24 @@ wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, ui
 	return cd;
 }
 
+ALWAYS_INLINE struct city_data *
+wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, uint32_t h)
+{
+	struct city_data *cd;
+
+	cd = wb_lookup_city(wb, name, len, h);
+	if (cd)
+		return cd;
+
+	return wb_create_city(wb, name, len, h);
+}
+
 struct parse_line_info {
 	uint32_t h;
 	int16_t temp;
 	uint8_t clen;
 	uint8_t advance;
 };
-
-ALWAYS_INLINE struct parse_line_info
-parse_line(const char *start)
-{
-	struct parse_line_info r;
-	uint64_t cv, tv, mv;
-	int adv, have;
-	int16_t minus_mult;
-	const char *s;
-
-	//
-	// Input: 'Foobar;4'
-	// Need to advance 6
-	//                         LE                     BE
-	//          4  ;  r a b o o F      F o o b a r  ;  4
-	//    cv 0x34_3b_7261626f6f46   0x466f6f626172_3b_34
-	//    mv 0x00_80_000000000000   0x000000000000_80_00
-	//     m 0x00_00_ffffffffffff   0xffffffffffff_00_00
-	//  bpos                   55                     48
-	//   adv                    7                      7
-	//
-	//
-
-	r.h = hash_setup();
-	s = start;
-	for (;;) {
-		/* load 8 bytes */
-		cv = load64(s);
-
-		/* zero out all semicolon bytes */
-		mv = cv ^ SEMICOLONS;
-
-		/* find out if any byte is zero */
-		tv = (mv & CARRYMASKS) + CARRYMASKS;
-
-		/* every byte that was zero is now 0x80 */
-		mv = ~(tv | mv | CARRYMASKS);
-
-		/* if there was a semicolon break */
-		if (mv)
-			break;
-
-		r.h = hash_update(r.h, cv);
-		s += sizeof(uint64_t);
-	}
-
-	/* find the location of the byte that was zero */
-	adv = count_trailing_zeroes64((long)mv) >> 3;
-
-	/* this can be done in one go, because if adv == 8 shift is 0 */
-	tv = (uint64_t)-1 >> (64 - ((adv + 1) << 3));
-
-	s += adv;
-	r.h = hash_update(r.h, cv & tv);
-
-	/* must be done in two steps, because if adv == 8 shift about is
-	 * size of the type. on most arches the shift is modulo.
-	 */
-	cv >>= 8;
-	cv >>= (adv << 3);
-
-	r.clen = s++ - start;
-
-	/* how many bytes we have that are valid */
-	have = 8 - (adv + 1);
-
-	/* shift in any partial */
-	if (have < MAX_TEMP_BYTES)
-		cv |= load64(s + have) << (have << 3);
-
-	/*
-	 * Sign multiplier:
-	 * Get either ..00000001 (1) or ..11111111 (-1)
-	 * the minus sign is ascii 0x2d while all digits are 0x30-0x39
-	 * so for '-' bit 4 is 0, while for digits it is 1
-	 *
-	 *                 minus digit(3x)
-	 *              -------- ---------
-	 * original     00101101  0011xxxx
-	 * mask-out     00000000  00010000
-	 * shift-right  00000000  00000001
-	 * subtract 1   11111111  00000000
-	 * or 1         11111111  00000001
-	 * result             -1         1
-	 */
-
-	// fprintf(stderr, "temp cv=0x%016lx\n", __builtin_bswap64(cv));
-
-	/* get the 4th bit to the 0 position */
-	tv = (cv & 0x10) >> 4;
-
-	s += (tv ^ 1);
-
-	/* shift out the minus */
-	cv >>= ((~cv & 0x10) >> 1);
-
-	/* convert from 0, 1 to 1, -1 */
-	tv -= 1;
-	tv |= 1;
-	minus_mult = (int16_t)tv;
-
-	/*
-	 * Convert 4 byte form to 3 byte form
-	 * If it is 3 byte form the second byte
-	 * is '.' with value 0x2e. Similarly with '-'
-	 * the 4'th bit of that value is 0.
-	 *
-	 *             4 bytes  3 bytes
-	 *             -------  --------
-	 * original    3x3x2E3x 3x2E3xyy
-	 * tv          00000000 00100000
-	 * shift-left         0        8
-	 * result      3x3x2e3x 003x2e3x
-	 *
-	 * Note that the high byte for 3 bytes is now 00 not 30
-	 */
-
-	tv = ~cv & (1 << 12);
-	cv <<= (tv >> 9);
-
-	s += 4 + ((cv >> 4) & 1);
-
-	/* calculate in one go */
-	r.temp = (int16_t)((((cv & TEMP_IN_MASK) * TEMP_MULT) >> TEMP_SHIFT) & TEMP_OUT_MASK) * minus_mult;
-
-	r.advance = (uint8_t)(s - start);
-
-	return r;
-}
 
 ALWAYS_INLINE struct parse_line_info
 parse_line_reference(const char *start, const char *end)
@@ -528,33 +420,6 @@ process_result(struct work_block *wb, struct parse_line_info r, const char *s)
 		cd->maxt = r.temp;
 }
 
-int wb_process_actual(struct work_block *wb)
-{
-	const char *s, *e;
-	struct parse_line_info r;
-	struct timespec tstart, tend;
-
-	clock_gettime(CLOCK_MONOTONIC, &tstart);
-
-	s = wb->wd->start + wb->offset;
-	e = s + wb->size;
-
-	madvise((void *)s, (size_t)(e - s), MADV_SEQUENTIAL | MADV_WILLNEED);
-
-	while (s < e) {
-		r = parse_line(s);
-		process_result(wb, r, s);
-		s += r.advance;
-	}
-
-	clock_gettime(CLOCK_MONOTONIC, &tend);
-
-	if (wb->wd->flags & WDF_TIMINGS)
-		fprintf(stderr, "%s: time=%lldns\n", __func__, delta_ns(tstart, tend));
-
-	return 0;
-}
-
 int wb_process_actual_reference(struct work_block *wb)
 {
 	const char *s, *e;
@@ -583,7 +448,7 @@ int wb_process_actual_reference(struct work_block *wb)
 	return 0;
 }
 
-int __attribute__((noinline)) wb_process_actual2(struct work_block *wb)
+int wb_process_actual(struct work_block *wb)
 {
 	struct city_data *cd;
 	const char *s, *e, *name;
@@ -591,7 +456,7 @@ int __attribute__((noinline)) wb_process_actual2(struct work_block *wb)
 	uint32_t h;
 	int adv, have;
 	size_t namelen;
-	int16_t minus_mult, temp;
+	int16_t temp;
 	struct timespec tstart, tend;
 
 	clock_gettime(CLOCK_MONOTONIC, &tstart);
@@ -601,7 +466,7 @@ int __attribute__((noinline)) wb_process_actual2(struct work_block *wb)
 
 	madvise((void *)s, (size_t)(e - s), MADV_SEQUENTIAL | MADV_WILLNEED);
 
-	while (s < e) {
+	while (likely(s < e)) {
 
 		name = s;
 
@@ -633,7 +498,7 @@ int __attribute__((noinline)) wb_process_actual2(struct work_block *wb)
 			mv = ~(tv | mv | CARRYMASKS);
 
 			/* if there was a semicolon break */
-			if (mv)
+			if (likely(mv))
 				break;
 
 			h = hash_update(h, cv);
@@ -693,7 +558,9 @@ int __attribute__((noinline)) wb_process_actual2(struct work_block *wb)
 		/* convert from 0, 1 to 1, -1 */
 		tv -= 1;
 		tv |= 1;
-		minus_mult = (int16_t)tv;
+
+		/* temp now contains just the sign */
+		temp = (int16_t)tv;
 
 		/*
 		 * Convert 4 byte form to 3 byte form
@@ -717,15 +584,15 @@ int __attribute__((noinline)) wb_process_actual2(struct work_block *wb)
 		s += 4 + ((cv >> 4) & 1);
 
 		/* calculate in one go */
-		temp = (int16_t)((((cv & TEMP_IN_MASK) * TEMP_MULT) >> TEMP_SHIFT) & TEMP_OUT_MASK) * minus_mult;
+		temp *= (int16_t)((((cv & TEMP_IN_MASK) * TEMP_MULT) >> TEMP_SHIFT) & TEMP_OUT_MASK);
 
 		cd = wb_lookup_or_create_city(wb, name, namelen, h);
 
 		cd->count++;
 		cd->sumt += temp;
-		if (temp < cd->mint)
+		if (unlikely(temp < cd->mint))
 			cd->mint = temp;
-		if (temp > cd->maxt)
+		if (unlikely(temp > cd->maxt))
 			cd->maxt = temp;
 	}
 
@@ -777,7 +644,7 @@ int wb_process(struct work_block *wb)
 	/* if there are no children, or too small we have to do the work */
 	if (nchildren <= 1 || wb->size < pagesz)
 		return !(wb->wd->flags & WDF_REFERENCE) ?
-				wb_process_actual2(wb) :
+				wb_process_actual(wb) :
 				wb_process_actual_reference(wb);
 
 	s = wb->wd->start + wb->offset;
@@ -909,9 +776,9 @@ void wb_report(struct work_block *wb)
 
 	clock_gettime(CLOCK_MONOTONIC, &tstart);
 
-	cdtab = malloc(sizeof(*cdtab) * wb->city_count);
+	cdtab = wb_malloc(wb, sizeof(*cdtab) * wb->city_count);
 	if (!cdtab)
-		perror("malloc");
+		perror("wb_malloc");
 
 	count = 0;
 	for (cd = wb->create_head; cd; cd = cd->cnext)
@@ -981,21 +848,34 @@ wd_open(const char *file, int workers, unsigned int flags)
 	struct weather_data *wd;
 	struct stat sb;
 	long sval;
-	size_t size_pgalign;
+	size_t pagesz, cachelinesz, size_pgalign;
+	void *p;
 	int rc;
-
-	wd = malloc(sizeof(*wd));
-	if (!wd)
-		goto err_out;
-	memset(wd, 0, sizeof(*wd));
-	wd->fd = -1;
-	wd->file = file;
-	wd->flags = flags;
 
 	sval = sysconf(_SC_PAGESIZE);
 	if (sval < 0)
 		perror("sysconf(_SC_PAGESIZE)");
-	wd->pagesz = (size_t)sval;
+	pagesz = (size_t)sval;
+
+	sval = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+	if (sval < 0)
+		perror("sysconf(_SC_LEVEL1_DCACHE_LINESIZE)");
+	cachelinesz = (size_t)sval;
+
+	/* allocate aligned to cacheline */
+	p = NULL;
+	rc = posix_memalign(&p, cachelinesz, sizeof(*wd));
+	if (rc) {
+		errno = rc;
+		perror("posix_memalign()");
+	}
+	wd = p;
+	memset(wd, 0, sizeof(*wd));
+	wd->fd = -1;
+	wd->file = file;
+	wd->flags = flags;
+	wd->pagesz = pagesz;
+	wd->cachelinesz = cachelinesz;
 
 	wd->fd = open(wd->file, O_RDONLY);
 	if (wd->fd < 0)
@@ -1055,6 +935,19 @@ wd_open(const char *file, int workers, unsigned int flags)
 err_out:
 	wd_close(wd);
 	return NULL;
+}
+
+void *wd_malloc(struct weather_data *wd, size_t size)
+{
+	void *p;
+	int rc;
+
+	rc = posix_memalign(&p, wd->cachelinesz, size);
+	if (rc) {
+		errno = rc;
+		return NULL;
+	}
+	return p;
 }
 
 void wd_close(struct weather_data *wd)
@@ -1195,7 +1088,9 @@ int do_work(const char *file, int workers, unsigned int flags)
 				file, strerror(errno));
 		return -1;
 	}
-	wd_report(wd);
+
+	if (!(flags & WDF_BENCH))
+		wd_report(wd);
 
 	/* if we were forked, close the stdout descriptor */
 	if (!(flags & WDF_NOFORK))

@@ -9,6 +9,7 @@ CC=gcc
 # CFLAGS=-O3 -Wall -fno-sanitize=address
 CFLAGS=-O3 -Wall -fno-sanitize=address -mcrc32 -g
 # CFLAGS=-O2 -Wall -fno-sanitize=address -mcrc32 -g -fno-omit-frame-pointer
+# CFLAGS=-O3 -Wall -fsanitize=address -mcrc32
 
 all: 1brc-c
 
