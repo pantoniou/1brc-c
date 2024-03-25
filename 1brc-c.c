@@ -47,12 +47,15 @@ delta_ns(struct timespec before, struct timespec after)
 
 #define ALWAYS_INLINE		static inline __attribute__((always_inline))
 
-#ifndef __CRC32__
-#define HASH_MURMUR
-#undef HASH_CRC32
-#else
+#if (defined(__x86_64__) && defined(__CRC32__)) || \
+    (defined(__aarch64__) && defined(__ARM_FEATURE_CRC32))
+/* automatically use crc32 hash is supported */
 #undef HASH_MURMUR
 #define HASH_CRC32
+#else
+// all others
+#define HASH_MURMUR
+#undef HASH_CRC32
 #endif
 
 ALWAYS_INLINE uint64_t load64(const void *p)
@@ -61,23 +64,13 @@ ALWAYS_INLINE uint64_t load64(const void *p)
 	return *(const uint64_t *)p;
 }
 
-ALWAYS_INLINE uint64_t load64_guard(const void *p, const void *e, const uint64_t guard)
+ALWAYS_INLINE int count_trailing_zeroes64(uint64_t v)
 {
-	uint64_t tmp;
-
-	/* in the buffer */
-	if ((p + sizeof(uint64_t)) <= e)
-		return load64(p);
-	if (p >= e)
-		return guard;
-	tmp = guard;
-	memcpy(&tmp, p, (size_t)(e - p));
-	return tmp;
-}
-
-ALWAYS_INLINE uint64_t load64_check(const void *p, const void *e, const uint64_t guard, const bool check)
-{
-	return check ? load64_guard(p, e, guard) : load64(p);
+#if LONG_MAX == 9223372036854775807L
+	return __builtin_ctzl((long)v);
+#else
+	return __builtin_ctzll((long long)v);
+#endif
 }
 
 #define SEMICOLON	0x3b  /*  ; */
@@ -90,11 +83,6 @@ ALWAYS_INLINE uint64_t load64_check(const void *p, const void *e, const uint64_t
 #define TEMP_MULT	(1 + (10 << 16) + (100 << 24))
 #define TEMP_SHIFT	24
 #define TEMP_OUT_MASK	((1 << 10) - 1)
-
-ALWAYS_INLINE int count_trailing_zeroes(uint64_t mv)
-{
-	return mv ? __builtin_ctzl((long)mv) : sizeof(uint64_t) * 8;
-}
 
 #ifdef HASH_MURMUR
 
@@ -132,10 +120,20 @@ ALWAYS_INLINE uint32_t hash_setup(void)
 	return (uint32_t)CRCPOLY;
 }
 
+#if defined(__x86_64__)
 ALWAYS_INLINE uint32_t hash_update(uint32_t h, uint64_t k)
 {
 	return (uint32_t)__builtin_ia32_crc32di((unsigned long long)h, (unsigned long long)k);
 }
+
+#elif defined(__aarch64__)
+ALWAYS_INLINE uint32_t hash_update(uint32_t h, uint64_t k)
+{
+	return (uint32_t)__builtin_aarch64_crc32d((h, k);
+}
+#else
+#error unsupported CRC arch
+#endif
 
 #endif
 
@@ -303,7 +301,6 @@ wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, ui
 				return cd;
 		}
 	} else {
-		abort();
 		/* hash colission detected? very unlikely but... probably bad hash algo */
 		for (; cd; cd = cd->next) {
 			if (cd->h == h && cd->len == len && !memcmp(cd->name, name, len))
@@ -339,14 +336,13 @@ struct parse_line_info {
 };
 
 ALWAYS_INLINE struct parse_line_info
-parse_line(const char *start, const char *end, const bool check)
+parse_line(const char *start)
 {
 	struct parse_line_info r;
 	uint64_t cv, tv, mv;
-	int pos, bpos, adv, have, minus_mult, tlen;
-	uint32_t h;
-	int16_t temp;
-	uint8_t clen;
+	int adv, have;
+	int16_t minus_mult;
+	const char *s;
 
 	//
 	// Input: 'Foobar;4'
@@ -361,19 +357,14 @@ parse_line(const char *start, const char *end, const bool check)
 	//
 	//
 
-	pos = 0;
-	h = hash_setup();
-
-	do {
-		assert(start + pos < end);
-
+	r.h = hash_setup();
+	s = start;
+	for (;;) {
 		/* load 8 bytes */
-		cv = load64(start + pos);
+		cv = load64(s);
 
 		/* zero out all semicolon bytes */
 		mv = cv ^ SEMICOLONS;
-
-		fprintf(stderr, "pos=%d cv=0x%016lx mv=0x%016lx\n", pos, __builtin_bswap64(cv), __builtin_bswap64(mv));
 
 		/* find out if any byte is zero */
 		tv = (mv & CARRYMASKS) + CARRYMASKS;
@@ -381,21 +372,22 @@ parse_line(const char *start, const char *end, const bool check)
 		/* every byte that was zero is now 0x80 */
 		mv = ~(tv | mv | CARRYMASKS);
 
-		/* number of trailing zeroes */
-		bpos = count_trailing_zeroes(mv);
+		/* if there was a semicolon break */
+		if (mv)
+			break;
 
-		/* convert it to a byte advance number */
-		adv = bpos >> 3;
+		r.h = hash_update(r.h, cv);
+		s += sizeof(uint64_t);
+	}
 
-		/* generate a mask for the hash update
-		 * note that the mask includes the semicolon
-		 */
-		tv = cv & ((uint64_t)-1) >> (64 - bpos);
+	/* find the location of the byte that was zero */
+	adv = count_trailing_zeroes64((long)mv) >> 3;
 
-		h = hash_update(h, tv);
-		pos += adv;
+	/* this can be done in one go, because if adv == 8 shift is 0 */
+	tv = (uint64_t)-1 >> (64 - ((adv + 1) << 3));
 
-	} while (!mv);
+	s += adv;
+	r.h = hash_update(r.h, cv & tv);
 
 	/* must be done in two steps, because if adv == 8 shift about is
 	 * size of the type. on most arches the shift is modulo.
@@ -403,14 +395,14 @@ parse_line(const char *start, const char *end, const bool check)
 	cv >>= 8;
 	cv >>= (adv << 3);
 
-	clen = (uint8_t)pos;
+	r.clen = s++ - start;
 
 	/* how many bytes we have that are valid */
 	have = 8 - (adv + 1);
 
 	/* shift in any partial */
 	if (have < MAX_TEMP_BYTES)
-		cv |= load64(start + pos + have);
+		cv |= load64(s + have) << (have << 3);
 
 	/*
 	 * Sign multiplier:
@@ -428,19 +420,20 @@ parse_line(const char *start, const char *end, const bool check)
 	 * result             -1         1
 	 */
 
-	fprintf(stderr, "temp cv=0x%016lx\n", __builtin_bswap64(cv));
+	// fprintf(stderr, "temp cv=0x%016lx\n", __builtin_bswap64(cv));
 
 	/* get the 4th bit to the 0 position */
 	tv = (cv & 0x10) >> 4;
 
-	tlen = (int)(tv ^ 1);
+	s += (tv ^ 1);
 
 	/* shift out the minus */
 	cv >>= ((~cv & 0x10) >> 1);
 
+	/* convert from 0, 1 to 1, -1 */
 	tv -= 1;
 	tv |= 1;
-	minus_mult = (int)tv;
+	minus_mult = (int16_t)tv;
 
 	/*
 	 * Convert 4 byte form to 3 byte form
@@ -461,20 +454,12 @@ parse_line(const char *start, const char *end, const bool check)
 	tv = ~cv & (1 << 12);
 	cv <<= (tv >> 9);
 
-	/* calculate */
-	temp = ((((cv & TEMP_IN_MASK) * TEMP_MULT) >> TEMP_SHIFT) & TEMP_OUT_MASK) * minus_mult;
+	s += 4 + ((cv >> 4) & 1);
 
-	tlen += 3 + ((cv >> 4) & 1);
+	/* calculate in one go */
+	r.temp = (int16_t)((((cv & TEMP_IN_MASK) * TEMP_MULT) >> TEMP_SHIFT) & TEMP_OUT_MASK) * minus_mult;
 
-	fprintf(stderr, "after cv=0x%016lx clen=%d tlen=%d - city=%.*s temp=%.*s (%d)\n",
-			__builtin_bswap64(cv), clen, tlen,
-			clen, start,
-			tlen, start + clen + 1,
-			temp);
-	r.h = h;
-	r.temp = temp;
-	r.clen = clen;
-	r.advance = clen + 1 + tlen + 1;
+	r.advance = (uint8_t)(s - start);
 
 	return r;
 }
@@ -524,19 +509,6 @@ parse_line_reference(const char *start, const char *end)
 	return r;
 }
 
-__attribute__((noinline)) struct parse_line_info
-parse_line_no_inline_no_check(const char *start, const char *end)
-{
-	return parse_line(start, end, false);
-}
-
-__attribute__((noinline)) struct parse_line_info
-parse_line_no_inline_check(const char *start, const char *end)
-{
-	return parse_line(start, end, true);
-}
-
-
 ALWAYS_INLINE void
 process_result(struct work_block *wb, struct parse_line_info r, const char *s)
 {
@@ -565,36 +537,11 @@ int wb_process_actual(struct work_block *wb)
 
 	madvise((void *)s, (size_t)(e - s), MADV_SEQUENTIAL | MADV_WILLNEED);
 
-#if 0
-	/* while we're safe, condition out bound limits */
-	while ((size_t)(e - s) >= MAX_LINE_SIZE) {
-		r = parse_line(s, e, false);
-		process_result(wb, r, s);
-		s += r.advance;
-	}
-
-	/* we need to check bounds now */
 	while (s < e) {
-		r = parse_line(s, e, true);
+		r = parse_line(s);
 		process_result(wb, r, s);
 		s += r.advance;
 	}
-#else
-	while (s < e) {
-#if 0
-		{
-			int pos = s - (wb->wd->start + wb->offset);
-
-			fprintf(stderr, "pos=%d left=%ld\n", pos, e - s);
-		}
-#endif
-
-		r = parse_line(s, e, false);
-		process_result(wb, r, s);
-		assert(r.advance > 0);
-		s += r.advance;
-	}
-#endif
 
 	clock_gettime(CLOCK_MONOTONIC, &tend);
 
