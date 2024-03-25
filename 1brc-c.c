@@ -156,17 +156,17 @@ struct city_data {
 // #define CITIES_HASH_SIZE	16384
 
 struct work_block {
+	unsigned int city_count;
+	struct city_data *create_head;
+	bool hash_collision;
 	struct weather_data *wd;
 	off_t offset;
 	size_t size;
-	unsigned int city_count;
-	unsigned int collisions;
-	struct city_data *cdtab[CITIES_HASH_SIZE];
-	uint8_t cdcol[CITIES_HASH_SIZE];
-	struct city_data *create_head;
 	struct work_block *parent;
 	unsigned int children_count;
 	struct work_block **children;
+	struct city_data *cdtab[CITIES_HASH_SIZE];
+	uint8_t cdcol[CITIES_HASH_SIZE];
 };
 
 struct weather_data {
@@ -274,10 +274,21 @@ wb_lookup_city(struct work_block *wb, const char *name, size_t len, uint32_t h)
 	unsigned int idx;
 
 	idx = (unsigned int)(h % (sizeof(wb->cdtab)/sizeof(wb->cdtab[0])));
-	for (cd = wb->cdtab[idx]; cd; cd = cd->next) {
-		if (cd->h != h)
-			continue;
-		return cd;
+	cd = wb->cdtab[idx];
+
+	if (!wb->hash_collision || !wb->cdcol[idx]) {
+		/* no hash collision detected */
+		for (; cd; cd = cd->next) {
+			if (cd->h == h)
+				return cd;
+		}
+	} else {
+		/* hash collision detected? very unlikely but... probably bad hash algo */
+		/* in this case we check the name as well */
+		for (; cd; cd = cd->next) {
+			if (cd->h == h && cd->len == len && !memcmp(cd->name, name, len))
+				return cd;
+		}
 	}
 
 	return NULL;
@@ -286,45 +297,38 @@ wb_lookup_city(struct work_block *wb, const char *name, size_t len, uint32_t h)
 ALWAYS_INLINE struct city_data *
 wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, uint32_t h)
 {
-	struct city_data *cd, **cdheadp;
+	struct city_data *cd, *cdt;
 	unsigned int idx;
 
-	idx = (unsigned int)(h % (sizeof(wb->cdtab)/sizeof(wb->cdtab[0])));
-
-	cdheadp = &wb->cdtab[idx];
-	cd = *cdheadp;
-#if 0
-	if (!(wb->cdcol[idx])) {
-		/* no hash colission detected */
-		for (; cd; cd = cd->next) {
-			if (cd->h == h)
-				return cd;
-		}
-	} else {
-		/* hash colission detected? very unlikely but... probably bad hash algo */
-		for (; cd; cd = cd->next) {
-			if (cd->h == h && cd->len == len && !memcmp(cd->name, name, len))
-				return cd;
-		}
-	}
-#else
-	/* no hash colission detected */
-	for (cd = wb->cdtab[idx]; cd; cd = cd->next) {
-		if (cd->h == h)
-			return cd;
-	}
-#endif
+	cd = wb_lookup_city(wb, name, len, h);
+	if (cd)
+		return cd;
 
 	cd = cd_create(name, len, h);
 	if (!cd)
 		perror("cd_create");
 
+	idx = (unsigned int)(h % (sizeof(wb->cdtab)/sizeof(wb->cdtab[0])));
+
 	/* link */
-	cd->next = *cdheadp;
-	*cdheadp = cd;
+	cd->next = cdt = wb->cdtab[idx];
+	wb->cdtab[idx] = cd;
 	cd->cnext = wb->create_head;
 	wb->create_head = cd;
 	wb->city_count++;
+
+	/* run through the list, and if there is a same hash, turn on collision detection
+	 * this is not just unlikely, if the hash quality is good its chances are
+	 * 1/(2^32) one in 4 billion
+	 */
+	for (; cdt; cdt = cdt->next) {
+		if (cdt->h == h) {
+			wb->cdcol[idx] = 1;
+			wb->hash_collision = true;
+			break;
+		}
+	}
+
 	return cd;
 }
 
@@ -579,6 +583,160 @@ int wb_process_actual_reference(struct work_block *wb)
 	return 0;
 }
 
+int __attribute__((noinline)) wb_process_actual2(struct work_block *wb)
+{
+	struct city_data *cd;
+	const char *s, *e, *name;
+	uint64_t cv, tv, mv;
+	uint32_t h;
+	int adv, have;
+	size_t namelen;
+	int16_t minus_mult, temp;
+	struct timespec tstart, tend;
+
+	clock_gettime(CLOCK_MONOTONIC, &tstart);
+
+	s = wb->wd->start + wb->offset;
+	e = s + wb->size;
+
+	madvise((void *)s, (size_t)(e - s), MADV_SEQUENTIAL | MADV_WILLNEED);
+
+	while (s < e) {
+
+		name = s;
+
+		//
+		// Input: 'Foobar;4'
+		// Need to advance 6
+		//                         LE                     BE
+		//          4  ;  r a b o o F      F o o b a r  ;  4
+		//    cv 0x34_3b_7261626f6f46   0x466f6f626172_3b_34
+		//    mv 0x00_80_000000000000   0x000000000000_80_00
+		//     m 0x00_00_ffffffffffff   0xffffffffffff_00_00
+		//  bpos                   55                     48
+		//   adv                    7                      7
+		//
+		//
+
+		h = hash_setup();
+		for (;;) {
+			/* load 8 bytes */
+			cv = load64(s);
+
+			/* zero out all semicolon bytes */
+			mv = cv ^ SEMICOLONS;
+
+			/* find out if any byte is zero */
+			tv = (mv & CARRYMASKS) + CARRYMASKS;
+
+			/* every byte that was zero is now 0x80 */
+			mv = ~(tv | mv | CARRYMASKS);
+
+			/* if there was a semicolon break */
+			if (mv)
+				break;
+
+			h = hash_update(h, cv);
+			s += sizeof(uint64_t);
+		}
+
+		/* find the location of the byte that was zero */
+		adv = count_trailing_zeroes64((long)mv) >> 3;
+
+		/* this can be done in one go, because if adv == 8 shift is 0 */
+		tv = (uint64_t)-1 >> (64 - ((adv + 1) << 3));
+
+		s += adv;
+		h = hash_update(h, cv & tv);
+
+		/* must be done in two steps, because if adv == 8 shift about is
+		 * size of the type. on most arches the shift is modulo.
+		 */
+		cv >>= 8;
+		cv >>= (adv << 3);
+
+		namelen = s++ - name;
+
+		/* how many bytes we have that are valid */
+		have = 8 - (adv + 1);
+
+		/* shift in any partial */
+		if (have < MAX_TEMP_BYTES)
+			cv |= load64(s + have) << (have << 3);
+
+		/*
+		 * Sign multiplier:
+		 * Get either ..00000001 (1) or ..11111111 (-1)
+		 * the minus sign is ascii 0x2d while all digits are 0x30-0x39
+		 * so for '-' bit 4 is 0, while for digits it is 1
+		 *
+		 *                 minus digit(3x)
+		 *              -------- ---------
+		 * original     00101101  0011xxxx
+		 * mask-out     00000000  00010000
+		 * shift-right  00000000  00000001
+		 * subtract 1   11111111  00000000
+		 * or 1         11111111  00000001
+		 * result             -1         1
+		 */
+
+		// fprintf(stderr, "temp cv=0x%016lx\n", __builtin_bswap64(cv));
+
+		/* get the 4th bit to the 0 position */
+		tv = (cv & 0x10) >> 4;
+
+		s += (tv ^ 1);
+
+		/* shift out the minus */
+		cv >>= ((~cv & 0x10) >> 1);
+
+		/* convert from 0, 1 to 1, -1 */
+		tv -= 1;
+		tv |= 1;
+		minus_mult = (int16_t)tv;
+
+		/*
+		 * Convert 4 byte form to 3 byte form
+		 * If it is 3 byte form the second byte
+		 * is '.' with value 0x2e. Similarly with '-'
+		 * the 4'th bit of that value is 0.
+		 *
+		 *             4 bytes  3 bytes
+		 *             -------  --------
+		 * original    3x3x2E3x 3x2E3xyy
+		 * tv          00000000 00100000
+		 * shift-left         0        8
+		 * result      3x3x2e3x 003x2e3x
+		 *
+		 * Note that the high byte for 3 bytes is now 00 not 30
+		 */
+
+		tv = ~cv & (1 << 12);
+		cv <<= (tv >> 9);
+
+		s += 4 + ((cv >> 4) & 1);
+
+		/* calculate in one go */
+		temp = (int16_t)((((cv & TEMP_IN_MASK) * TEMP_MULT) >> TEMP_SHIFT) & TEMP_OUT_MASK) * minus_mult;
+
+		cd = wb_lookup_or_create_city(wb, name, namelen, h);
+
+		cd->count++;
+		cd->sumt += temp;
+		if (temp < cd->mint)
+			cd->mint = temp;
+		if (temp > cd->maxt)
+			cd->maxt = temp;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &tend);
+
+	if (wb->wd->flags & WDF_TIMINGS)
+		fprintf(stderr, "%s: time=%lldns\n", __func__, delta_ns(tstart, tend));
+
+	return 0;
+}
+
 int wb_process(struct work_block *wb);
 
 static void *wb_thread_start(void *arg)
@@ -619,7 +777,7 @@ int wb_process(struct work_block *wb)
 	/* if there are no children, or too small we have to do the work */
 	if (nchildren <= 1 || wb->size < pagesz)
 		return !(wb->wd->flags & WDF_REFERENCE) ?
-				wb_process_actual(wb) :
+				wb_process_actual2(wb) :
 				wb_process_actual_reference(wb);
 
 	s = wb->wd->start + wb->offset;
