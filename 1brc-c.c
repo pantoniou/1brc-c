@@ -347,7 +347,7 @@ wb_lookup_or_create_city(struct work_block *wb, const char *name, size_t len, ui
 	struct city_data *cd;
 
 	cd = wb_lookup_city(wb, name, len, h);
-	if (cd)
+	if (likely(cd))
 		return cd;
 
 	return wb_create_city(wb, name, len, h);
